@@ -1,4 +1,5 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
+import copy
 import os
 import random
 import time
@@ -27,9 +28,9 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ppo-humanoid-baselines"
+    wandb_project_name: str = "grpo-vs-ppo"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "bryanoliveira"
     """the entity (team) of wandb's project"""
     wandb_group: str = ""
     """the group name for wandb runs"""
@@ -39,17 +40,17 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 1
+    num_envs: int = 8
     """the number of parallel game environments"""
     num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout (0 = episode mode)"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
+    gamma: float = 0.999
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation (used for both actor and critic unless overridden)"""
@@ -57,8 +58,8 @@ class Args:
     """lambda for the actor advantage (defaults to gae_lambda if None)"""
     gae_lambda_critic: float = None
     """lambda for the critic return target (defaults to gae_lambda if None)"""
-    num_minibatches: int = 32
-    """the number of mini-batches"""
+    minibatch_size: int = 64
+    """the number of steps per mini-batch"""
     update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
@@ -86,13 +87,13 @@ class Args:
     use_vf: bool = True
     """if disabled, skips critic forward passes and value loss entirely (only valid in episode mode)"""
     grpo: bool = False
-    """shorthand: sets --num-steps=0 --return-type=mc --baseline-type=group_mean --scale-adv-group --no-norm-adv --no-use-vf"""
+    """shorthand: sets --num-steps=0 --return-type=mc --baseline-type=group_mean --scale-adv-group --no-norm-adv --no-use-vf --gamma=1.0"""
 
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
-    minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
+    num_minibatches: int = 0
+    """the number of mini-batches (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
@@ -193,6 +194,30 @@ class Agent(nn.Module):
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
 
 
+def record_video(agent, env_id, run_name, label, device, obs_rms):
+    """Run one greedy episode and save a video to runs/{run_name}/videos/."""
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    video_dir = f"runs/{run_name}/videos"
+    try:
+        venv = gym.make(env_id, render_mode="rgb_array")
+        venv = gym.wrappers.ClipAction(venv)
+        venv_norm = gym.wrappers.NormalizeObservation(venv)
+        venv_norm.obs_rms = copy.deepcopy(obs_rms)
+        venv = gym.wrappers.TransformObservation(venv_norm, lambda obs: np.clip(obs, -10, 10))
+        venv = gym.wrappers.RecordVideo(venv, video_dir, episode_trigger=lambda _: True, name_prefix=label)
+        obs, _ = venv.reset()
+        done = False
+        while not done:
+            obs_t = torch.Tensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action, _, _, _ = agent.get_action_and_value(obs_t, compute_value=False)
+            obs, _, terminated, truncated, _ = venv.step(action.cpu().numpy()[0])
+            done = terminated or truncated
+        venv.close()
+    except Exception as e:
+        print(f"Warning: video recording failed for {label}: {e}")
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     if args.grpo:
@@ -202,6 +227,7 @@ if __name__ == "__main__":
         args.scale_adv_group = True
         args.norm_adv = False
         args.use_vf = False
+        args.gamma = 1.0
     if args.gae_lambda_actor is None:
         args.gae_lambda_actor = args.gae_lambda
     if args.gae_lambda_critic is None:
@@ -213,7 +239,7 @@ if __name__ == "__main__":
     assert args.return_type != "mc" or episode_mode, "--return-type mc requires episode mode (--num-steps 0)"
     if not episode_mode:
         args.batch_size = int(args.num_envs * args.num_steps)
-        args.minibatch_size = int(args.batch_size // args.num_minibatches)
+        args.num_minibatches = max(1, args.batch_size // args.minibatch_size)
         args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -250,7 +276,8 @@ if __name__ == "__main__":
     if args.sparse:
         envs = SparseRewardWrapper(envs)
     envs = gym.wrappers.ClipAction(envs)
-    envs = gym.wrappers.NormalizeObservation(envs)
+    norm_obs_env = gym.wrappers.NormalizeObservation(envs)
+    envs = norm_obs_env
     envs = gym.wrappers.TransformObservation(envs, lambda obs: np.clip(obs, -10, 10))
     envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
     envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -10, 10))
@@ -274,6 +301,10 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+
+    video_milestones = [int(args.total_timesteps * f) for f in (0.25, 0.50, 0.75, 1.00)]
+    video_labels = ["25pct", "50pct", "75pct", "100pct"]
+    next_video_idx = 0
 
     iteration = 0
     while global_step < args.total_timesteps:
@@ -387,11 +418,14 @@ if __name__ == "__main__":
                     group_mean = ep_means.mean()
                     b_advantages = b_returns - group_mean
                     if args.scale_adv_group:
-                        b_advantages = b_advantages / (ep_means.std() + 1e-8)
+                        group_std = ep_means.std(correction=0)
+                        if group_std > 1e-8:
+                            b_advantages = b_advantages / group_std
 
             H = max(len(per_env_obs[i]) for i in range(args.num_envs))
             batch_size = b_obs.shape[0]
-            minibatch_size = max(1, batch_size // args.num_minibatches)
+            num_minibatches = max(1, batch_size // args.minibatch_size)
+            minibatch_size = batch_size // num_minibatches
         else:
             # === PHASE 1: DATA COLLECTION ===
             for step in range(0, args.num_steps):
@@ -419,7 +453,8 @@ if __name__ == "__main__":
 
             H = args.num_steps
             batch_size = args.batch_size
-            minibatch_size = args.minibatch_size
+            num_minibatches = args.num_minibatches
+            minibatch_size = batch_size // num_minibatches
 
             # === PHASE 2: RETURN CALCULATION ===
             with torch.no_grad():
@@ -474,7 +509,7 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std(correction=0) + 1e-8)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -554,10 +589,17 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+        while next_video_idx < len(video_milestones) and global_step >= video_milestones[next_video_idx]:
+            record_video(agent, args.env_id, run_name, video_labels[next_video_idx], device, norm_obs_env.obs_rms)
+            next_video_idx += 1
+
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
+
+    with open(f"runs/{run_name}/DONE", "w") as f:
+        f.write(str(time.time()) + "\n")
 
     envs.close()
     writer.close()
