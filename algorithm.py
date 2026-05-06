@@ -52,7 +52,11 @@ class Args:
     gamma: float = 0.99
     """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
+    """the lambda for the general advantage estimation (used for both actor and critic unless overridden)"""
+    gae_lambda_actor: float = None
+    """lambda for the actor advantage (defaults to gae_lambda if None)"""
+    gae_lambda_critic: float = None
+    """lambda for the critic return target (defaults to gae_lambda if None)"""
     num_minibatches: int = 32
     """the number of mini-batches"""
     update_epochs: int = 10
@@ -198,6 +202,10 @@ if __name__ == "__main__":
         args.scale_adv_group = True
         args.norm_adv = False
         args.use_vf = False
+    if args.gae_lambda_actor is None:
+        args.gae_lambda_actor = args.gae_lambda
+    if args.gae_lambda_critic is None:
+        args.gae_lambda_critic = args.gae_lambda
     if args.seed == 0:
         args.seed = random.randint(1, 2**31 - 1)
     episode_mode = args.num_steps == 0
@@ -324,26 +332,38 @@ if __name__ == "__main__":
             # === PHASE 2: RETURN CALCULATION ===
             b_obs_chunks, b_act_chunks, b_lp_chunks = [], [], []
             b_adv_chunks, b_ret_chunks, b_val_chunks = [], [], []
+            b_mc_ret_chunks = []  # always compute MC returns for diagnostics
             for i in range(args.num_envs):
                 rewards_i = torch.stack(per_env_rewards[i])
                 H_i = len(rewards_i)
 
+                # MC returns (used by mc mode and by diagnostics)
+                mc_ret = torch.zeros(H_i, device=device)
+                R = 0.0
+                for t in reversed(range(H_i)):
+                    R = rewards_i[t].item() + args.gamma * R
+                    mc_ret[t] = R
+                b_mc_ret_chunks.append(mc_ret)
+
                 if args.return_type == "gae":
                     V_i = torch.stack(per_env_values[i])
-                    # Complete episode: no mid-episode dones, next_done=1 (no bootstrap).
-                    adv = compute_gae(rewards_i, V_i, torch.zeros(H_i, device=device),
+                    zeros_i = torch.zeros(H_i, device=device)
+                    # Actor advantage (policy target)
+                    adv = compute_gae(rewards_i, V_i, zeros_i,
                                       next_value=0.0, next_done=1.0,
-                                      gamma=args.gamma, gae_lambda=args.gae_lambda)
+                                      gamma=args.gamma, gae_lambda=args.gae_lambda_actor)
                     b_adv_chunks.append(adv)
-                    b_ret_chunks.append(adv + V_i)
+                    # Critic return target (may use different lambda)
+                    if args.gae_lambda_critic == args.gae_lambda_actor:
+                        b_ret_chunks.append(adv + V_i)
+                    else:
+                        adv_critic = compute_gae(rewards_i, V_i, zeros_i,
+                                                 next_value=0.0, next_done=1.0,
+                                                 gamma=args.gamma, gae_lambda=args.gae_lambda_critic)
+                        b_ret_chunks.append(adv_critic + V_i)
                     b_val_chunks.append(V_i)
                 elif args.return_type == "mc":
-                    ret = torch.zeros(H_i, device=device)
-                    R = 0.0
-                    for t in reversed(range(H_i)):
-                        R = per_env_rewards[i][t].item() + args.gamma * R
-                        ret[t] = R
-                    b_ret_chunks.append(ret)
+                    b_ret_chunks.append(mc_ret)
 
                 b_obs_chunks.append(torch.stack(per_env_obs[i]))
                 b_act_chunks.append(torch.stack(per_env_actions[i]))
@@ -409,9 +429,19 @@ if __name__ == "__main__":
                     advantages[:, env_i] = compute_gae(
                         rewards[:, env_i], values[:, env_i], dones[:, env_i],
                         next_value=next_value[env_i], next_done=next_done[env_i],
-                        gamma=args.gamma, gae_lambda=args.gae_lambda,
+                        gamma=args.gamma, gae_lambda=args.gae_lambda_actor,
                     )
-                returns = advantages + values
+                if args.gae_lambda_critic == args.gae_lambda_actor:
+                    returns = advantages + values
+                else:
+                    adv_critic = torch.zeros_like(rewards)
+                    for env_i in range(args.num_envs):
+                        adv_critic[:, env_i] = compute_gae(
+                            rewards[:, env_i], values[:, env_i], dones[:, env_i],
+                            next_value=next_value[env_i], next_done=next_done[env_i],
+                            gamma=args.gamma, gae_lambda=args.gae_lambda_critic,
+                        )
+                    returns = adv_critic + values
 
             # flatten the batch
             b_obs        = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -492,6 +522,35 @@ if __name__ == "__main__":
             explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
             writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
+            # MC explained variance: V predictions vs true MC returns
+            if episode_mode:
+                b_mc_returns = torch.cat(b_mc_ret_chunks).cpu().numpy()
+                var_mc = np.var(b_mc_returns)
+                mc_ev = np.nan if var_mc == 0 else 1 - np.var(b_mc_returns - y_pred) / var_mc
+                writer.add_scalar("losses/mc_explained_variance", mc_ev, global_step)
+
+        # Advantage magnitude by position (steps from episode end)
+        if episode_mode:
+            max_h = max(len(per_env_rewards[i]) for i in range(args.num_envs))
+            adv_by_pos = torch.zeros(max_h, device=device)
+            count_by_pos = torch.zeros(max_h, device=device)
+            offset = 0
+            for i in range(args.num_envs):
+                h_i = len(per_env_rewards[i])
+                # Index by steps-from-end: position 0 = last step
+                adv_i = b_advantages[offset:offset + h_i].abs()
+                for t in range(h_i):
+                    pos = h_i - 1 - t  # steps from end
+                    adv_by_pos[pos] += adv_i[t]
+                    count_by_pos[pos] += 1
+                offset += h_i
+            mean_adv_by_pos = adv_by_pos / count_by_pos.clamp(min=1)
+            # Log a few quantiles: near end, mid, far from end
+            writer.add_scalar("diagnostics/adv_abs_near_end", mean_adv_by_pos[0].item(), global_step)
+            mid = max_h // 2
+            writer.add_scalar("diagnostics/adv_abs_mid", mean_adv_by_pos[mid].item(), global_step)
+            writer.add_scalar("diagnostics/adv_abs_far_end", mean_adv_by_pos[max_h - 1].item(), global_step)
+
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
