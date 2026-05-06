@@ -65,3 +65,25 @@ wait
 ```
 
 Set `NODE_ID` to the current machine's index and adjust `--jobs` based on available cores.
+
+## Syncing runs and generating plots
+
+Training runs log to wandb. To generate plots locally, first sync the tfevents files from wandb into `runs/`:
+
+```bash
+uv run python scripts/wandb_fetch_runs.py --sync
+```
+
+This downloads tfevents for all finished runs and writes a `DONE` marker in each run directory. It also deletes local directories for crashed runs so they can be re-queued.
+
+Once runs are synced, generate the paper figures:
+
+```bash
+uv run python plot_paper.py
+```
+
+Figures are written to `paper/fig/`. To generate a subset:
+
+```bash
+uv run python plot_paper.py fig1 fig4
+```
