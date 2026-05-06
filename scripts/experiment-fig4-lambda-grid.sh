@@ -64,7 +64,7 @@ done
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
-mkdir -p logs
+mkdir -p logs locks
 run_commands=()
 for idx in "${!all_commands[@]}"; do
   if (( idx % num_instances != cur_instance )); then continue; fi
@@ -73,12 +73,17 @@ for idx in "${!all_commands[@]}"; do
   exp_name="$(echo "$entry" | cut -d' ' -f2)"
   seed="$(echo "$entry" | cut -d' ' -f3)"
   rest="$(echo "$entry" | cut -d' ' -f4-)"
+  lockfile="locks/${ENV_}__${exp_name}__${seed}.lock"
 
   if compgen -G "runs/${ENV_}__${exp_name}__${seed}__*/DONE" > /dev/null 2>&1; then
-    echo "Skipping ${ENV_}__${exp_name}__${seed} (already done)"
+    echo "Skipping ${ENV_}__${exp_name}__${seed} (done)"
     continue
   fi
-  run_commands+=(".venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig4 >> logs/${ENV}__${exp_name}__${seed}.log 2>&1")
+  if [ -f "$lockfile" ]; then
+    echo "Skipping ${ENV_}__${exp_name}__${seed} (in-progress or failed — rm $lockfile to retry)"
+    continue
+  fi
+  run_commands+=("touch ${lockfile} && .venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig4 >> logs/${ENV_}__${exp_name}__${seed}.log 2>&1")
 done
 
 echo "About to run ${#run_commands[@]}/${#all_commands[@]} experiments (fig4 lambda-grid, jobs=${jobs_per_instance})."

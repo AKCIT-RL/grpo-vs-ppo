@@ -23,6 +23,9 @@ dependencies = [
     "rich<12.0",
     "tenacity>=8.2.2",
     "tyro>=0.5.10",
+    "matplotlib>=3.10.9",
+    "scipy>=1.17.1",
+    "envpool>=1.2.0",
 ]
 
 [project.optional-dependencies]

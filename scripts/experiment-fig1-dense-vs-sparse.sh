@@ -45,7 +45,7 @@ if [ -z "$num_instances" ] || [ -z "$cur_instance" ]; then
   fi
 fi
 
-envs=(Humanoid-v4 HalfCheetah-v4 Ant-v4)
+envs=(Humanoid-v4 Hopper-v4 Walker2d-v4)
 
 # Each entry: "<exp_name> <extra args>"
 # Tag convention: float values use dot-to-underscore (0.99 -> 0_99, 1.0 -> 1_0)
@@ -72,7 +72,7 @@ done
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
-mkdir -p logs
+mkdir -p logs locks
 run_commands=()
 for idx in "${!all_commands[@]}"; do
   if (( idx % num_instances != cur_instance )); then continue; fi
@@ -81,13 +81,17 @@ for idx in "${!all_commands[@]}"; do
   exp_name="$(echo "$entry" | cut -d' ' -f2)"
   seed="$(echo "$entry" | cut -d' ' -f3)"
   rest="$(echo "$entry" | cut -d' ' -f4-)"
+  lockfile="locks/${ENV}__${exp_name}__${seed}.lock"
 
-  # Skip if any run matching this (env, exp_name, seed) already exists.
   if compgen -G "runs/${ENV}__${exp_name}__${seed}__*/DONE" > /dev/null 2>&1; then
-    echo "Skipping ${ENV}__${exp_name}__${seed} (already done)"
+    echo "Skipping ${ENV}__${exp_name}__${seed} (done)"
     continue
   fi
-  run_commands+=(".venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig1 >> logs/${ENV}__${exp_name}__${seed}.log 2>&1")
+  if [ -f "$lockfile" ]; then
+    echo "Skipping ${ENV}__${exp_name}__${seed} (in-progress or failed — rm $lockfile to retry)"
+    continue
+  fi
+  run_commands+=("touch ${lockfile} && .venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig1 >> logs/${ENV}__${exp_name}__${seed}.log 2>&1")
 done
 
 echo "About to run ${#run_commands[@]}/${#all_commands[@]} experiments (fig1, jobs=${jobs_per_instance})."

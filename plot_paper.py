@@ -49,10 +49,11 @@ C_PPO_SPARSE   = "#ff7f0e"   # orange — PPO sparse (same config, sparse reward
 # Fig 2: gamma sweep — viridis ramp, light→dark as γ increases
 _G_CMAP    = plt.cm.viridis
 GAMMA_COLORS = {
-    "0_9":  _G_CMAP(0.10),
-    "0_95": _G_CMAP(0.35),
-    "0_99": _G_CMAP(0.65),
-    "1_0":  _G_CMAP(0.90),
+    "0_9":   _G_CMAP(0.10),
+    "0_95":  _G_CMAP(0.35),
+    "0_99":  _G_CMAP(0.60),
+    "0_999": _G_CMAP(0.78),
+    "1_0":   _G_CMAP(0.95),
 }
 
 # Fig 3: baselines
@@ -64,10 +65,10 @@ _LA_CMAP = plt.cm.Blues
 _LC_CMAP = plt.cm.Oranges
 LAM_VALS = [0.0, 0.5, 0.95, 1.0]
 
-# Fig 5: N sweep — viridis ramp light→dark as N increases
-_N_CMAP = plt.cm.viridis
-N_VALS   = [16, 32, 64, 128, 256, 512, 1024, 2048]
-N_COLORS = {N: _N_CMAP(i / (len(N_VALS) - 1)) for i, N in enumerate(N_VALS)}
+# Fig 5: H sweep — viridis ramp light→dark as H increases
+_H_CMAP = plt.cm.viridis
+H_VALS   = [16, 32, 64, 128, 256, 512, 1024, 2048]
+H_COLORS = {H: _H_CMAP(i / (len(H_VALS) - 1)) for i, H in enumerate(H_VALS)}
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
 
@@ -235,11 +236,13 @@ def _shared_legend(fig, ax, ncol=3):
 
 def fig1():
     print("Fig 1: dense vs sparse vs GRPO")
-    envs = ["Humanoid-v4", "HalfCheetah-v4", "Ant-v4"]
+    envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
     conditions = [
-        ("grpo_g1_0_sparse",       "GRPO (sparse, γ=1)",          C_GRPO,      "-"),
-        ("ppo_g0_99_n2048_dense",  "PPO dense (γ=0.99, N=2048)",  C_PPO_DENSE, "-"),
-        ("ppo_g0_99_n2048_sparse", "PPO sparse (γ=0.99, N=2048)", C_PPO_SPARSE, "--"),
+        ("grpo_g1_0_sparse",        "GRPO",            C_GRPO,       "-"),
+        ("ppo_g0_999_n2048_dense",  "PPO dense (H=2048)",   C_PPO_DENSE,  "-"),
+        ("ppo_g0_999_n2048_sparse", "PPO sparse (H=2048)",  C_PPO_SPARSE, "--"),
+        ("ppo_g0_999_n256_dense",   "PPO dense (H=256)",    C_PPO_DENSE,  ":"),
+        ("ppo_g0_999_n256_sparse",  "PPO sparse (H=256)",   C_PPO_SPARSE, ":"),
     ]
 
     fig, axes = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5),
@@ -263,8 +266,8 @@ def fig1():
 
 def fig2():
     print("Fig 2: gamma sweep")
-    envs = ["Humanoid-v4", "HalfCheetah-v4", "Ant-v4"]
-    gammas = [("0_9", "γ=0.9"), ("0_95", "γ=0.95"), ("0_99", "γ=0.99"), ("1_0", "γ=1")]
+    envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
+    gammas = [("0_9", "γ=0.9"), ("0_95", "γ=0.95"), ("0_99", "γ=0.99"), ("0_999", "γ=0.999"), ("1_0", "γ=1")]
 
     fig, axes = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5),
                              sharey=False)
@@ -289,11 +292,10 @@ def fig2():
 
 def fig3():
     print("Fig 3: VF as baseline")
-    envs = ["Humanoid-v4", "HalfCheetah-v4", "Ant-v4"]
+    envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
     conditions = [
-        ("grpo_g1_0_sparse",       "GRPO (group mean+std, no VF)", C_GRPO,  "-"),
+        ("grpo_g1_0_sparse",      "GRPO", C_GRPO,  "-"),
         ("ppo_mc_vf_g1_0_sparse", "PPO GAE λ=1 (VF baseline)",   C_MC_VF, "-"),
-        ("ppo_mc_bm_g1_0_sparse", "PPO MC (group mean, no VF)",  C_MC_BM, "--"),
     ]
 
     # Main: episodic return
@@ -361,7 +363,7 @@ def fig4():
     ax.set_yticklabels(ticks, fontsize=8)
     ax.set_xlabel("λ_critic", fontsize=9)
     ax.set_ylabel("λ_actor", fontsize=9)
-    ax.set_title(f"{env} — final return (sparse, γ=1, N=16)", fontsize=9)
+    ax.set_title(f"{env} — final return (sparse, γ=1, H=16)", fontsize=9)
     for i in range(len(LAM_VALS)):
         for j in range(len(LAM_VALS)):
             if not np.isnan(grid[i, j]):
@@ -378,7 +380,7 @@ def fig4():
         atag = str(la).replace(".", "_")
         exp_name = f"ppo_g1_0_n16_a{atag}_c0_0_sparse"
         plot_condition(ax, env, exp_name, f"λ_a={la}", colors_la[i])
-    _finish_ax(ax, title=f"{env} — λ_critic=0, sweep λ_actor (sparse, γ=1, N=16)",
+    _finish_ax(ax, title=f"{env} — λ_critic=0, sweep λ_actor (sparse, γ=1, H=16)",
                legend_outside=False)
     fig_lc.tight_layout()
     _save(fig_lc, "fig4_lambda_actor_sweep")
@@ -389,7 +391,7 @@ def fig4():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fig5():
-    print("Fig 5: subtrajectory N sweep")
+    print("Fig 5: subtrajectory H sweep")
     env = "Humanoid-v4"
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -398,38 +400,38 @@ def fig5():
     plot_condition(ax, env, "grpo_g1_0_sparse", "GRPO (episodic, no VF)",
                    C_GRPO, linestyle="--")
 
-    # PPO N sweep (λ_actor=1.0, λ_critic=0.0); N=16 reuses fig4 a1_0_c0_0 run
-    for i, N in enumerate(N_VALS):
-        exp_name = f"ppo_g1_0_n{N}_a1_0_c0_0_sparse"
-        color = N_COLORS[N]
-        plot_condition(ax, env, exp_name, f"PPO N={N}", color)
+    # PPO H sweep (λ_actor=1.0, λ_critic=0.0); H=16 reuses fig4 a1_0_c0_0 run
+    for i, H in enumerate(H_VALS):
+        exp_name = f"ppo_g1_0_n{H}_a1_0_c0_0_sparse"
+        color = H_COLORS[H]
+        plot_condition(ax, env, exp_name, f"PPO H={H}", color)
 
     _finish_ax(ax, title=f"{env} — subtrajectory learning (sparse, γ=1, λ_a=1, λ_c=0)",
                legend_outside=False)
     fig.tight_layout()
     _save(fig, "fig5_subtrajectory_n_sweep")
 
-    # Bar chart: final return vs N
+    # Bar chart: final return vs H
     final_returns = {}
     grpo_curves = load_condition(env, "grpo_g1_0_sparse")
     if grpo_curves:
         _, grpo_mean, _ = _align(grpo_curves)
         final_returns["GRPO"] = grpo_mean[-1]
-    for N in N_VALS:
-        curves = load_condition(env, f"ppo_g1_0_n{N}_a1_0_c0_0_sparse")
+    for H in H_VALS:
+        curves = load_condition(env, f"ppo_g1_0_n{H}_a1_0_c0_0_sparse")
         if curves:
             _, m, _ = _align(curves)
-            final_returns[str(N)] = m[-1]
+            final_returns[str(H)] = m[-1]
 
     if final_returns:
         fig_bar, ax_bar = plt.subplots(figsize=(7, 3.5))
         labels = list(final_returns.keys())
         vals   = list(final_returns.values())
-        colors = [C_GRPO] + [N_COLORS[N] for N in N_VALS if str(N) in final_returns]
+        colors = [C_GRPO] + [H_COLORS[H] for H in H_VALS if str(H) in final_returns]
         ax_bar.bar(range(len(labels)), vals, color=colors[:len(labels)])
         ax_bar.set_xticks(range(len(labels)))
         ax_bar.set_xticklabels(labels, fontsize=8)
-        ax_bar.set_xlabel("N (rollout steps) / method", fontsize=9)
+        ax_bar.set_xlabel("H (rollout steps) / method", fontsize=9)
         ax_bar.set_ylabel("Final episodic return", fontsize=9)
         ax_bar.set_title(f"{env} — final return vs rollout length (sparse, γ=1)", fontsize=9)
         ax_bar.spines["top"].set_visible(False)
