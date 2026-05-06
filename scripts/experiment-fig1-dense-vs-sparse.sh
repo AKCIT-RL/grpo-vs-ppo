@@ -65,8 +65,9 @@ all_commands=()
 for seed in {1..5}; do
   for ENV in "${envs[@]}"; do
     for cond in "${CONDITIONS[@]}"; do
-      exp_name="$(echo "$cond" | cut -d' ' -f1)"
-      extra="$(echo "$cond" | cut -d' ' -f2-)"
+      exp_name="${cond%% *}"
+      extra="${cond#* }"
+      if [ "$extra" = "$cond" ]; then extra=""; fi
       all_commands+=("${ENV} ${exp_name} ${seed} --env-id ${ENV} --seed ${seed} ${extra}")
     done
   done
