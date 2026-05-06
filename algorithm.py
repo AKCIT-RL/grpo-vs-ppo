@@ -101,7 +101,11 @@ class SparseRewardWrapper(gym.Wrapper):
 
 
 class EnvPoolAdapter(gym.Wrapper):
-    """Adapts an envpool env to the gymnasium VectorEnv interface expected by the training loop."""
+    """Minimal shim to make envpool gymnasium envs look like a gymnasium VectorEnv.
+
+    Exposes single_observation_space / single_action_space / is_vector_env and
+    absorbs the seed/options kwargs that downstream wrappers pass to reset().
+    """
 
     def __init__(self, env, num_envs: int):
         super().__init__(env)
@@ -109,33 +113,9 @@ class EnvPoolAdapter(gym.Wrapper):
         self.is_vector_env = True
         self.single_observation_space = env.observation_space
         self.single_action_space = env.action_space
-        self._ep_returns = np.zeros(num_envs, dtype=np.float64)
-        self._ep_lengths = np.zeros(num_envs, dtype=np.int32)
 
     def reset(self, seed=None, options=None):
-        obs, info = self.env.reset()
-        self._ep_returns[:] = 0
-        self._ep_lengths[:] = 0
-        return obs, info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._ep_returns += reward
-        self._ep_lengths += 1
-        done = terminated | truncated
-        if done.any():
-            final_info = [None] * self.num_envs
-            for i in np.where(done)[0]:
-                final_info[i] = {
-                    "episode": {
-                        "r": float(self._ep_returns[i]),
-                        "l": int(self._ep_lengths[i]),
-                    }
-                }
-            info["final_info"] = final_info
-            self._ep_returns[done] = 0
-            self._ep_lengths[done] = 0
-        return obs, reward, terminated, truncated, info
+        return self.env.reset()
 
 
 
@@ -217,8 +197,10 @@ if __name__ == "__main__":
     # env setup
     envs = envpool.make(args.env_id, env_type="gymnasium", num_envs=args.num_envs, seed=args.seed)
     envs = EnvPoolAdapter(envs, args.num_envs)
+    envs = gym.wrappers.RecordEpisodeStatistics(envs)
     if args.sparse:
         envs = SparseRewardWrapper(envs)
+    envs = gym.wrappers.ClipAction(envs)
     envs = gym.wrappers.NormalizeObservation(envs)
     envs = gym.wrappers.TransformObservation(envs, lambda obs: np.clip(obs, -10, 10))
     envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
