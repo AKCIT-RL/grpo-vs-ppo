@@ -67,7 +67,7 @@ LAM_VALS = [0.0, 0.5, 0.95, 1.0]
 
 # Fig 5: H sweep — viridis ramp light→dark as H increases
 _H_CMAP = plt.cm.viridis
-H_VALS   = [16, 32, 64, 128, 256, 512, 1024, 2048]
+H_VALS   = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 H_COLORS = {H: _H_CMAP(i / (len(H_VALS) - 1)) for i, H in enumerate(H_VALS)}
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
@@ -143,10 +143,15 @@ def _load_scalar(run_dir: str, metric: str):
 # ── Run discovery ──────────────────────────────────────────────────────────────
 
 def find_runs(env_id: str, exp_name: str, n_seeds: int = N_SEEDS) -> list[str]:
-    """Return sorted list of run dirs matching {env_id}__{exp_name}__{seed}__*
-    for seeds 1..n_seeds.  Picks the most recent run if multiple timestamps exist."""
+    """Return sorted list of run dirs matching {env_id}__{exp_name}__{seed}
+    for seeds 1..n_seeds.  Checks exact path first, falls back to __* glob
+    for legacy dirs with timestamps."""
     dirs = []
     for seed in range(1, n_seeds + 1):
+        exact = os.path.join(RUNS_DIR, f"{env_id}__{exp_name}__{seed}")
+        if os.path.isdir(exact):
+            dirs.append(exact)
+            continue
         pattern = os.path.join(RUNS_DIR, f"{env_id}__{exp_name}__{seed}__*")
         matches = sorted(glob.glob(pattern))
         if matches:
@@ -238,11 +243,9 @@ def fig1():
     print("Fig 1: dense vs sparse vs GRPO")
     envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
     conditions = [
-        ("grpo_g1_0_sparse",        "GRPO",            C_GRPO,       "-"),
-        ("ppo_g0_999_n2048_dense",  "PPO dense (H=2048)",   C_PPO_DENSE,  "-"),
-        ("ppo_g0_999_n2048_sparse", "PPO sparse (H=2048)",  C_PPO_SPARSE, "--"),
-        ("ppo_g0_999_n256_dense",   "PPO dense (H=256)",    C_PPO_DENSE,  ":"),
-        ("ppo_g0_999_n256_sparse",  "PPO sparse (H=256)",   C_PPO_SPARSE, ":"),
+        ("grpo__sparse",                          "GRPO",        C_GRPO,       "-"),
+        ("ppo__g0_999__n256__a0_95__c_0_95__dense",  "PPO dense",   C_PPO_DENSE,  "-"),
+        ("ppo__g0_999__n256__a0_95__c_0_95__sparse", "PPO sparse",  C_PPO_SPARSE, "--"),
     ]
 
     fig, axes = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5),
@@ -273,7 +276,7 @@ def fig2():
                              sharey=False)
     for ax, env in zip(axes, envs):
         for gtag, glabel in gammas:
-            exp_name = f"ppo_g{gtag}_n2048_sparse"
+            exp_name = f"ppo__g{gtag}__n256__a0_95__c_0_95__sparse"
             color    = GAMMA_COLORS[gtag]
             plot_condition(ax, env, exp_name, glabel, color)
         _finish_ax(ax, title=env, legend=(ax is axes[-1]))
@@ -294,8 +297,8 @@ def fig3():
     print("Fig 3: VF as baseline")
     envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
     conditions = [
-        ("grpo_g1_0_sparse",      "GRPO", C_GRPO,  "-"),
-        ("ppo_mc_vf_g1_0_sparse", "PPO GAE λ=1 (VF baseline)",   C_MC_VF, "-"),
+        ("grpo_sparse",                    "GRPO",                    C_GRPO,  "-"),
+        ("ppo__g1_0__n0__a1_0__c1_0__sparse", "PPO GAE λ=1 (VF baseline)", C_MC_VF, "-"),
     ]
 
     # Main: episodic return
@@ -318,7 +321,7 @@ def fig3():
         ("losses/mc_explained_variance", "MC EV   (true returns)",        C_MC_VF, "--"),
     ]
     env = "Humanoid-v4"
-    exp_name = "ppo_mc_vf_g1_0_sparse"
+    exp_name = "ppo__g1_0__n0__a1_0__c1_0__sparse"
     fig_ev, ax = plt.subplots(figsize=(4.5, 3.2))
     for metric, label, color, ls in ev_metrics:
         curves = load_condition(env, exp_name, metric=metric)
@@ -346,7 +349,7 @@ def fig4():
         for j, lc in enumerate(LAM_VALS):
             atag = str(la).replace(".", "_")
             ctag = str(lc).replace(".", "_")
-            exp_name = f"ppo_g1_0_n16_a{atag}_c{ctag}_sparse"
+            exp_name = f"ppo__g1_0__n256__a{atag}__c{ctag}__sparse"
             curves = load_condition(env, exp_name)
             if curves:
                 x, mean, _ = _align(curves)
@@ -363,7 +366,7 @@ def fig4():
     ax.set_yticklabels(ticks, fontsize=8)
     ax.set_xlabel("λ_critic", fontsize=9)
     ax.set_ylabel("λ_actor", fontsize=9)
-    ax.set_title(f"{env} — final return (sparse, γ=1, H=16)", fontsize=9)
+    ax.set_title(f"{env} — final return (sparse, γ=1, H=256)", fontsize=9)
     for i in range(len(LAM_VALS)):
         for j in range(len(LAM_VALS)):
             if not np.isnan(grid[i, j]):
@@ -378,9 +381,9 @@ def fig4():
     colors_la = [_LA_CMAP(0.3 + 0.6 * i / (n_actor - 1)) for i in range(n_actor)]
     for i, la in enumerate(LAM_VALS):
         atag = str(la).replace(".", "_")
-        exp_name = f"ppo_g1_0_n16_a{atag}_c0_0_sparse"
+        exp_name = f"ppo__g1_0__n256__a{atag}__c0_0__sparse"
         plot_condition(ax, env, exp_name, f"λ_a={la}", colors_la[i])
-    _finish_ax(ax, title=f"{env} — λ_critic=0, sweep λ_actor (sparse, γ=1, H=16)",
+    _finish_ax(ax, title=f"{env} — λ_critic=0, sweep λ_actor (sparse, γ=1, H=256)",
                legend_outside=False)
     fig_lc.tight_layout()
     _save(fig_lc, "fig4_lambda_actor_sweep")
@@ -396,29 +399,29 @@ def fig5():
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    # GRPO reference (shared exp_name with fig1/fig3)
-    plot_condition(ax, env, "grpo_g1_0_sparse", "GRPO (episodic, no VF)",
+    # GRPO reference (shared exp_name with fig3)
+    plot_condition(ax, env, "grpo_sparse", "GRPO (episodic, no VF)",
                    C_GRPO, linestyle="--")
 
-    # PPO H sweep (λ_actor=1.0, λ_critic=0.0); H=16 reuses fig4 a1_0_c0_0 run
+    # PPO H sweep (default GAE λ=0.95)
     for i, H in enumerate(H_VALS):
-        exp_name = f"ppo_g1_0_n{H}_a1_0_c0_0_sparse"
+        exp_name = f"ppo__g1_0__n{H}__a0_95__c0_95__sparse"
         color = H_COLORS[H]
         plot_condition(ax, env, exp_name, f"PPO H={H}", color)
 
-    _finish_ax(ax, title=f"{env} — subtrajectory learning (sparse, γ=1, λ_a=1, λ_c=0)",
+    _finish_ax(ax, title=f"{env} — subtrajectory learning (sparse, γ=1)",
                legend_outside=False)
     fig.tight_layout()
     _save(fig, "fig5_subtrajectory_n_sweep")
 
     # Bar chart: final return vs H
     final_returns = {}
-    grpo_curves = load_condition(env, "grpo_g1_0_sparse")
+    grpo_curves = load_condition(env, "grpo_sparse")
     if grpo_curves:
         _, grpo_mean, _ = _align(grpo_curves)
         final_returns["GRPO"] = grpo_mean[-1]
     for H in H_VALS:
-        curves = load_condition(env, f"ppo_g1_0_n{H}_a1_0_c0_0_sparse")
+        curves = load_condition(env, f"ppo__g1_0__n{H}__a0_95__c0_95__sparse")
         if curves:
             _, m, _ = _align(curves)
             final_returns[str(H)] = m[-1]
