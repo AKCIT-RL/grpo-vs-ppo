@@ -376,8 +376,11 @@ if __name__ == "__main__":
                     mc_ret[t] = R
                 b_mc_ret_chunks.append(mc_ret)
 
-                if args.return_type == "gae":
+                if args.use_vf:
                     V_i = torch.stack(per_env_values[i])
+                    b_val_chunks.append(V_i)
+
+                if args.return_type == "gae":
                     zeros_i = torch.zeros(H_i, device=device)
                     # Actor advantage (policy target)
                     adv = compute_gae(rewards_i, V_i, zeros_i,
@@ -392,7 +395,6 @@ if __name__ == "__main__":
                                                  next_value=0.0, next_done=1.0,
                                                  gamma=args.gamma, gae_lambda=args.gae_lambda_critic)
                         b_ret_chunks.append(adv_critic + V_i)
-                    b_val_chunks.append(V_i)
                 elif args.return_type == "mc":
                     b_ret_chunks.append(mc_ret)
 
@@ -478,6 +480,16 @@ if __name__ == "__main__":
                         )
                     returns = adv_critic + values
 
+            # MC returns (lambda=1) for MC explained variance diagnostic
+            mc_advantages = torch.zeros_like(rewards)
+            for env_i in range(args.num_envs):
+                mc_advantages[:, env_i] = compute_gae(
+                    rewards[:, env_i], values[:, env_i], dones[:, env_i],
+                    next_value=next_value[env_i], next_done=next_done[env_i],
+                    gamma=args.gamma, gae_lambda=1.0,
+                )
+            b_mc_returns_fixed = (mc_advantages + values).reshape(-1)
+
             # flatten the batch
             b_obs        = obs.reshape((-1,) + envs.single_observation_space.shape)
             b_logprobs   = logprobs.reshape(-1)
@@ -560,9 +572,11 @@ if __name__ == "__main__":
             # MC explained variance: V predictions vs true MC returns
             if episode_mode:
                 b_mc_returns = torch.cat(b_mc_ret_chunks).cpu().numpy()
-                var_mc = np.var(b_mc_returns)
-                mc_ev = np.nan if var_mc == 0 else 1 - np.var(b_mc_returns - y_pred) / var_mc
-                writer.add_scalar("losses/mc_explained_variance", mc_ev, global_step)
+            else:
+                b_mc_returns = b_mc_returns_fixed.cpu().numpy()
+            var_mc = np.var(b_mc_returns)
+            mc_ev = np.nan if var_mc == 0 else 1 - np.var(b_mc_returns - y_pred) / var_mc
+            writer.add_scalar("losses/mc_explained_variance", mc_ev, global_step)
 
         # Advantage magnitude by position (steps from episode end)
         if episode_mode:
