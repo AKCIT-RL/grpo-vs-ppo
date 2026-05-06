@@ -7,10 +7,10 @@ Used by experiment scripts to skip runs already completed in wandb:
   ...
   grep -qxF "${ENV}__${exp_name}__${seed}" "$wandb_runs" && echo "skip" && continue
 
-With --sync the script also:
-  Finished runs -- create runs/{run_name}/ if needed, download tfevents, write DONE.
-  Crashed runs  -- delete runs/{run_name}/ and locks/{run_name}.lock so the
-                   experiment scripts will re-queue them.
+With --sync: create runs/{run_name}/ if needed, download tfevents, write DONE for
+  each finished run. Also downloads tfevents for running runs without writing DONE.
+With --clean: delete runs/{run_name}/ for crashed runs so experiment scripts
+  will re-queue them.
 """
 import argparse
 import pathlib
@@ -49,6 +49,31 @@ def sync_finished(run: "wandb.apis.public.Run", runs_root: pathlib.Path) -> None
     print(f"  synced {name}", file=sys.stderr)
 
 
+def sync_running(
+    run: "wandb.apis.public.Run",
+    runs_root: pathlib.Path,
+) -> None:
+    """Download latest tfevents for a running run without writing DONE."""
+    name = run.display_name
+    run_dir = runs_root / name
+
+    if (run_dir / "DONE").exists():
+        return
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in run.files():
+        if "tfevents" not in f.name:
+            continue
+        dest = run_dir / pathlib.Path(f.name).name
+        f.download(root=str(run_dir), replace=True)
+        downloaded_path = run_dir / f.name
+        if downloaded_path.exists() and downloaded_path != dest:
+            downloaded_path.rename(dest)
+
+    print(f"  synced running {name}", file=sys.stderr)
+
+
 def sync_crashed(
     run: "wandb.apis.public.Run",
     runs_root: pathlib.Path,
@@ -70,7 +95,12 @@ def main() -> None:
     parser.add_argument(
         "--sync",
         action="store_true",
-        help="Download tfevents + write DONE for finished runs; delete dirs for crashed runs.",
+        help="Download tfevents + write DONE for finished runs.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Delete local dirs for crashed runs so they get re-queued.",
     )
     parser.add_argument(
         "--check",
@@ -94,9 +124,7 @@ def main() -> None:
 
     runs_root = pathlib.Path(args.runs_root)
 
-    api = wandb.Api()
-
-    if args.sync:
+    if args.clean:
         crashed = api.runs(
             f"{args.entity}/{args.project}",
             filters={"state": "crashed"},
@@ -104,6 +132,15 @@ def main() -> None:
         )
         for run in crashed:
             sync_crashed(run, runs_root)
+
+    if args.sync:
+        running = api.runs(
+            f"{args.entity}/{args.project}",
+            filters={"state": "running"},
+            per_page=1000,
+        )
+        for run in running:
+            sync_running(run, runs_root)
 
     finished = api.runs(
         f"{args.entity}/{args.project}",
