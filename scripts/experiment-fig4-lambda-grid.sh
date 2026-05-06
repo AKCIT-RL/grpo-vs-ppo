@@ -20,11 +20,15 @@ num_instances=""
 cur_instance=""
 jobs_per_instance=1
 dry_run=false
+reverse_order=false
+random_order=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --jobs)               jobs_per_instance="$2";   shift 2 ;;
     --dry-run)            dry_run=true;               shift ;;
+    --reverse)            reverse_order=true;         shift ;;
+    --random)             random_order=true;          shift ;;
     *)
       if   [ -z "$num_instances" ]; then num_instances="$1"
       elif [ -z "$cur_instance"  ]; then cur_instance="$1"
@@ -94,6 +98,22 @@ for idx in "${!all_commands[@]}"; do
   run_commands+=("mkdir -p ${run_dir} && touch ${run_dir}/LOCK && .venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig4 >> ${run_dir}/run.log 2>&1")
   run_names+=("${run_name}")
 done
+
+# Reorder if requested
+if $random_order; then
+  indices=($(shuf -i 0-$(( ${#run_commands[@]} - 1 )) 2>/dev/null || true))
+  if (( ${#indices[@]} > 0 )); then
+    _cmds=(); _names=()
+    for i in "${indices[@]}"; do _cmds+=("${run_commands[$i]}"); _names+=("${run_names[$i]}"); done
+    run_commands=("${_cmds[@]}"); run_names=("${_names[@]}")
+  fi
+elif $reverse_order; then
+  _cmds=(); _names=()
+  for (( i=${#run_commands[@]}-1; i>=0; i-- )); do
+    _cmds+=("${run_commands[$i]}"); _names+=("${run_names[$i]}")
+  done
+  run_commands=("${_cmds[@]}"); run_names=("${_names[@]}")
+fi
 
 echo "About to run ${#run_commands[@]}/${#all_commands[@]} experiments (fig4 lambda-grid, jobs=${jobs_per_instance})."
 if $dry_run; then exit 0; fi
