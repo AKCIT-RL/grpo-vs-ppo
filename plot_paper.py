@@ -251,8 +251,27 @@ def fig1():
     fig, axes = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5),
                              sharey=False)
     for ax, env in zip(axes, envs):
+        finals = {}
         for exp_name, label, color, ls in conditions:
-            plot_condition(ax, env, exp_name, label, color, ls)
+            val = plot_condition(ax, env, exp_name, label, color, ls)
+            finals[exp_name] = val
+
+        # Arrow annotating the dense→sparse gap at the right edge
+        dense_key  = "ppo__g0_999__n256__a0_95__c_0_95__dense"
+        sparse_key = "ppo__g0_999__n256__a0_95__c_0_95__sparse"
+        y_dense  = finals.get(dense_key)
+        y_sparse = finals.get(sparse_key)
+        if y_dense is not None and y_sparse is not None and y_dense != y_sparse:
+            x_ann = MAX_STEPS / 1e6
+            ax.annotate(
+                "", xy=(x_ann, y_sparse), xytext=(x_ann, y_dense),
+                arrowprops=dict(arrowstyle="<->", color="black", lw=1.2),
+            )
+            mid = (y_dense + y_sparse) / 2
+            gap = abs(y_dense - y_sparse)
+            ax.text(x_ann * 1.01, mid, f"Δ{gap:.0f}", va="center",
+                    fontsize=7, color="black", clip_on=False)
+
         _finish_ax(ax, title=env, legend=(ax is axes[-1]))
     axes[0].set_ylabel("Episodic return", fontsize=9)
     for ax in axes[1:]:
@@ -314,23 +333,28 @@ def fig3():
     fig_ret.tight_layout()
     _save(fig_ret, "fig3_baselines")
 
-    # Diagnostic: explained variance for VF condition
+    # Diagnostic: explained variance for VF condition, all envs
     print("  Fig 3 (EV diagnostic)")
     ev_metrics = [
-        ("losses/explained_variance",    "GAE EV  (λ-bootstrap target)", C_MC_VF, "-"),
-        ("losses/mc_explained_variance", "MC EV   (true returns)",        C_MC_VF, "--"),
+        ("losses/explained_variance",    "GAE EV (λ-bootstrap target)", C_MC_VF, "-"),
+        ("losses/mc_explained_variance", "MC EV (true returns)",         C_MC_VF, "--"),
     ]
-    env = "Humanoid-v4"
     exp_name = "ppo__g1_0__n0__a1_0__c1_0__sparse"
-    fig_ev, ax = plt.subplots(figsize=(4.5, 3.2))
-    for metric, label, color, ls in ev_metrics:
-        curves = load_condition(env, exp_name, metric=metric)
-        if curves:
-            x, mean, ci = _align(curves)
-            ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=ls, label=label)
-            ax.fill_between(x / 1e6, mean - ci, mean + ci, color=color, alpha=CI_ALPHA)
-    _finish_ax(ax, title=f"{env} — VF explained variance",
-               ylabel="Explained variance", legend_outside=False)
+    fig_ev, axes_ev = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.2),
+                                   sharey=False)
+    for ax, env in zip(axes_ev, envs):
+        for metric, label, color, ls in ev_metrics:
+            curves = load_condition(env, exp_name, metric=metric)
+            if curves:
+                x, mean, ci = _align(curves)
+                ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=ls, label=label)
+                ax.fill_between(x / 1e6, mean - ci, mean + ci, color=color, alpha=CI_ALPHA)
+        _finish_ax(ax, title=env, ylabel="Explained variance",
+                   legend=(ax is axes_ev[-1]))
+    axes_ev[0].set_ylabel("Explained variance", fontsize=9)
+    for ax in axes_ev[1:]:
+        ax.set_ylabel("")
+    _shared_legend(fig_ev, axes_ev[-1], ncol=len(ev_metrics))
     fig_ev.tight_layout()
     _save(fig_ev, "fig3_ev_diagnostic")
 
@@ -399,48 +423,19 @@ def fig5():
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    # GRPO reference (shared exp_name with fig3)
-    plot_condition(ax, env, "grpo_sparse", "GRPO (episodic, no VF)",
+    # GRPO reference
+    plot_condition(ax, env, "grpo__sparse", "GRPO (episodic, no VF)",
                    C_GRPO, linestyle="--")
 
     # PPO H sweep (default GAE λ=0.95)
-    for i, H in enumerate(H_VALS):
+    for H in H_VALS:
         exp_name = f"ppo__g1_0__n{H}__a0_95__c0_95__sparse"
-        color = H_COLORS[H]
-        plot_condition(ax, env, exp_name, f"PPO H={H}", color)
+        plot_condition(ax, env, exp_name, f"PPO H={H}", H_COLORS[H])
 
     _finish_ax(ax, title=f"{env} — subtrajectory learning (sparse, γ=1)",
                legend_outside=False)
     fig.tight_layout()
     _save(fig, "fig5_subtrajectory_n_sweep")
-
-    # Bar chart: final return vs H
-    final_returns = {}
-    grpo_curves = load_condition(env, "grpo_sparse")
-    if grpo_curves:
-        _, grpo_mean, _ = _align(grpo_curves)
-        final_returns["GRPO"] = grpo_mean[-1]
-    for H in H_VALS:
-        curves = load_condition(env, f"ppo__g1_0__n{H}__a0_95__c0_95__sparse")
-        if curves:
-            _, m, _ = _align(curves)
-            final_returns[str(H)] = m[-1]
-
-    if final_returns:
-        fig_bar, ax_bar = plt.subplots(figsize=(7, 3.5))
-        labels = list(final_returns.keys())
-        vals   = list(final_returns.values())
-        colors = [C_GRPO] + [H_COLORS[H] for H in H_VALS if str(H) in final_returns]
-        ax_bar.bar(range(len(labels)), vals, color=colors[:len(labels)])
-        ax_bar.set_xticks(range(len(labels)))
-        ax_bar.set_xticklabels(labels, fontsize=8)
-        ax_bar.set_xlabel("H (rollout steps) / method", fontsize=9)
-        ax_bar.set_ylabel("Final episodic return", fontsize=9)
-        ax_bar.set_title(f"{env} — final return vs rollout length (sparse, γ=1)", fontsize=9)
-        ax_bar.spines["top"].set_visible(False)
-        ax_bar.spines["right"].set_visible(False)
-        fig_bar.tight_layout()
-        _save(fig_bar, "fig5_subtrajectory_final_return")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

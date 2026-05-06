@@ -256,6 +256,8 @@ if __name__ == "__main__":
             save_code=True,
         )
     writer = SummaryWriter(f"runs/{run_name}")
+    if args.track:
+        wandb.save(f"runs/{run_name}/events.out.tfevents.*", base_path=".", policy="live")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
