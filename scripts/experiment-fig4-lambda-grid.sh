@@ -54,18 +54,21 @@ for seed in {1..5}; do
     for lc in "${lambda_critic_values[@]}"; do
       atag="${la//./_}"
       ctag="${lc//./_}"
-      # Tag convention matches fig5: 1.0 -> 1_0, 0.0 -> 0_0
-      # ppo_g1_0_n16_a1_0_c0_0_sparse is shared with fig5 N=32 entry -- skipped automatically.
-      exp_name="ppo_g1_0_n16_a${atag}_c${ctag}_sparse"
-      all_commands+=("${ENV} ${exp_name} ${seed} --env-id ${ENV} --seed ${seed} --num-steps 32 --gamma 1.0 --sparse --gae-lambda-actor ${la} --gae-lambda-critic ${lc}")
+      exp_name="ppo__g1_0__n256__a${atag}__c${ctag}__sparse"
+      all_commands+=("${ENV} ${exp_name} ${seed} --env-id ${ENV} --seed ${seed} --num-steps 256 --gamma 1.0 --sparse --gae-lambda-actor ${la} --gae-lambda-critic ${lc}")
     done
   done
 done
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
-mkdir -p logs locks
+
+wandb_runs="$(mktemp)"
+echo "Fetching finished runs from wandb..."
+.venv/bin/python scripts/wandb_fetch_runs.py --sync > "$wandb_runs" 2>/dev/null || true
+
 run_commands=()
+run_names=()
 for idx in "${!all_commands[@]}"; do
   if (( idx % num_instances != cur_instance )); then continue; fi
   entry="${all_commands[$idx]}"
@@ -73,30 +76,44 @@ for idx in "${!all_commands[@]}"; do
   exp_name="$(echo "$entry" | cut -d' ' -f2)"
   seed="$(echo "$entry" | cut -d' ' -f3)"
   rest="$(echo "$entry" | cut -d' ' -f4-)"
-  lockfile="locks/${ENV_}__${exp_name}__${seed}.lock"
+  run_dir="runs/${ENV_}__${exp_name}__${seed}"
+  run_name="${ENV_}__${exp_name}__${seed}"
 
-  if compgen -G "runs/${ENV_}__${exp_name}__${seed}__*/DONE" > /dev/null 2>&1; then
-    echo "Skipping ${ENV_}__${exp_name}__${seed} (done)"
+  if [ -f "${run_dir}/DONE" ]; then
+    echo "Skipping ${run_name} (done)"
     continue
   fi
-  if [ -f "$lockfile" ]; then
-    echo "Skipping ${ENV_}__${exp_name}__${seed} (in-progress or failed — rm $lockfile to retry)"
+  if grep -qxF "${run_name}" "$wandb_runs" 2>/dev/null; then
+    echo "Skipping ${run_name} (finished in wandb)"
     continue
   fi
-  run_commands+=("touch ${lockfile} && .venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig4 >> logs/${ENV_}__${exp_name}__${seed}.log 2>&1")
+  if [ -f "${run_dir}/LOCK" ]; then
+    echo "Skipping ${run_name} (in-progress or failed — rm ${run_dir}/LOCK to retry)"
+    continue
+  fi
+  run_commands+=("mkdir -p ${run_dir} && touch ${run_dir}/LOCK && .venv/bin/python algorithm.py ${rest} --exp-name ${exp_name} --track --wandb-group fig4 >> ${run_dir}/run.log 2>&1")
+  run_names+=("${run_name}")
 done
 
 echo "About to run ${#run_commands[@]}/${#all_commands[@]} experiments (fig4 lambda-grid, jobs=${jobs_per_instance})."
 if $dry_run; then exit 0; fi
 
 if (( jobs_per_instance <= 1 )); then
-  for cmd in "${run_commands[@]}"; do
-    $SHELL -c "$cmd"
+  for i in "${!run_commands[@]}"; do
+    if .venv/bin/python scripts/wandb_fetch_runs.py --check "${run_names[$i]}" 2>/dev/null; then
+      echo "Skipping ${run_names[$i]} (now active in wandb)"
+      continue
+    fi
+    $SHELL -c "${run_commands[$i]}"
     sleep 1
   done
 else
-  for cmd in "${run_commands[@]}"; do
-    $SHELL -c "$cmd" &
+  for i in "${!run_commands[@]}"; do
+    if .venv/bin/python scripts/wandb_fetch_runs.py --check "${run_names[$i]}" 2>/dev/null; then
+      echo "Skipping ${run_names[$i]} (now active in wandb)"
+      continue
+    fi
+    $SHELL -c "${run_commands[$i]}" &
     while (( $(jobs -rp | wc -l) >= jobs_per_instance )); do
       wait -n 2>/dev/null || true
     done

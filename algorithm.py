@@ -30,7 +30,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "grpo-vs-ppo"
     """the wandb's project name"""
-    wandb_entity: str = "bryanoliveira"
+    wandb_entity: str = "marcospaulo2-federal-university-of-goi-s"
     """the entity (team) of wandb's project"""
     wandb_group: str = ""
     """the group name for wandb runs"""
@@ -46,7 +46,7 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 8
     """the number of parallel game environments"""
-    num_steps: int = 2048
+    num_steps: int = 256
     """the number of steps to run in each environment per policy rollout (0 = episode mode)"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -241,7 +241,7 @@ if __name__ == "__main__":
         args.batch_size = int(args.num_envs * args.num_steps)
         args.num_minibatches = max(1, args.batch_size // args.minibatch_size)
         args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
     if args.track:
         import wandb
 
