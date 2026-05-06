@@ -26,6 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+envpool = ["envpool>=1.2.0"]
 mujoco = [
     "mujoco<=2.3.3",
     "imageio>=2.14.1,<3",

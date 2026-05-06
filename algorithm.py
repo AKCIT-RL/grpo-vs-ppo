@@ -4,6 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 
+import envpool
 import gymnasium as gym
 import numpy as np
 import torch
@@ -32,14 +33,8 @@ class Args:
     """the entity (team) of wandb's project"""
     wandb_group: str = ""
     """the group name for wandb runs"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
@@ -92,35 +87,56 @@ class SparseRewardWrapper(gym.Wrapper):
     """Accumulates dense rewards and delivers the sum only at episode end."""
 
     def reset(self, **kwargs):
-        self._accumulated = 0.0
-        return super().reset(**kwargs)
+        obs, info = super().reset(**kwargs)
+        self._accumulated = np.zeros(self.env.num_envs, dtype=float)
+        return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        self._accumulated += float(reward)
-        sparse = self._accumulated if (terminated or truncated) else 0.0
+        done = terminated | truncated
+        self._accumulated += np.asarray(reward, dtype=float)
+        sparse = np.where(done, self._accumulated, 0.0)
+        self._accumulated[done] = 0.0
         return obs, sparse, terminated, truncated, info
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma, sparse=False):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if sparse:
-            env = SparseRewardWrapper(env)
-        env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        return env
+class EnvPoolAdapter(gym.Wrapper):
+    """Adapts an envpool env to the gymnasium VectorEnv interface expected by the training loop."""
 
-    return thunk
+    def __init__(self, env, num_envs: int):
+        super().__init__(env)
+        self.num_envs = num_envs
+        self.is_vector_env = True
+        self.single_observation_space = env.observation_space
+        self.single_action_space = env.action_space
+        self._ep_returns = np.zeros(num_envs, dtype=np.float64)
+        self._ep_lengths = np.zeros(num_envs, dtype=np.int32)
+
+    def reset(self, seed=None, options=None):
+        obs, info = self.env.reset()
+        self._ep_returns[:] = 0
+        self._ep_lengths[:] = 0
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._ep_returns += reward
+        self._ep_lengths += 1
+        done = terminated | truncated
+        if done.any():
+            final_info = [None] * self.num_envs
+            for i in np.where(done)[0]:
+                final_info[i] = {
+                    "episode": {
+                        "r": float(self._ep_returns[i]),
+                        "l": int(self._ep_lengths[i]),
+                    }
+                }
+            info["final_info"] = final_info
+            self._ep_returns[done] = 0
+            self._ep_lengths[done] = 0
+        return obs, reward, terminated, truncated, info
+
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -197,9 +213,14 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma, args.sparse) for i in range(args.num_envs)]
-    )
+    envs = envpool.make(args.env_id, env_type="gymnasium", num_envs=args.num_envs, seed=args.seed)
+    envs = EnvPoolAdapter(envs, args.num_envs)
+    if args.sparse:
+        envs = SparseRewardWrapper(envs)
+    envs = gym.wrappers.NormalizeObservation(envs)
+    envs = gym.wrappers.TransformObservation(envs, lambda obs: np.clip(obs, -10, 10))
+    envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
+    envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -10, 10))
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
@@ -350,27 +371,6 @@ if __name__ == "__main__":
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_eval import evaluate
-
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()
