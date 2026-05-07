@@ -2,7 +2,7 @@
 # Fig 5 — Subtrajectory learning: PPO sparse γ=1, N sweep vs GRPO
 #
 # (1 + 8 N values) × 5 seeds = 45 runs.  Humanoid-v4 sparse, γ=1.
-# grpo_sparse runs are shared with fig1 and fig3 — skipped automatically.
+# grpo__sparse runs are shared with fig1 and fig3 — skipped automatically.
 #
 # λ_actor=1 gives MC-like advantages for a fair comparison with GRPO.
 # λ_critic=0 gives pure TD(0) bootstrapping, maximising credit-assignment
@@ -57,7 +57,7 @@ all_commands=()
 
 for seed in {1..5}; do
   # GRPO reference — exp_name matches fig1/fig3, skipped automatically if already done.
-  all_commands+=("${ENV} grpo_sparse ${seed} --env-id ${ENV} --seed ${seed} --grpo --sparse")
+  all_commands+=("${ENV} grpo__sparse ${seed} --env-id ${ENV} --seed ${seed} --grpo --sparse")
 
   for N in "${n_values[@]}"; do
     exp_name="ppo__g1_0__n${N}__a0_95__c0_95__sparse"

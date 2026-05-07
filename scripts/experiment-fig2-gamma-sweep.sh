@@ -53,7 +53,7 @@ for seed in {1..5}; do
   for ENV in "${envs[@]}"; do
     for gamma in "${gammas[@]}"; do
       gtag="${gamma//./_}"
-      exp_name="ppo__g${gtag}__n256__a0_95__c_0_95__sparse"
+      exp_name="ppo__g${gtag}__n256__a0_95__c0_95__sparse"
       all_commands+=("${ENV} ${exp_name} ${seed} --env-id ${ENV} --seed ${seed} --gamma ${gamma} --sparse")
     done
   done

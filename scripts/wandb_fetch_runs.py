@@ -7,27 +7,35 @@ Used by experiment scripts to skip runs already completed in wandb:
   ...
   grep -qxF "${ENV}__${exp_name}__${seed}" "$wandb_runs" && echo "skip" && continue
 
-With --sync: download tfevents for finished and running runs. Finished runs
-  get a DONE marker; running runs do not. Falls back to rebuilding from W&B
-  history when no tfevents file was uploaded. Skips runs that have a local
-  LOCK file (running on this machine).
+With --sync: download tfevents for finished and running runs. Skips runs
+  where local data is already up to date (tracked via .sync_step). Finished
+  runs get a DONE marker; running runs do not. Falls back to rebuilding from
+  W&B history when no tfevents file was uploaded. Skips runs with a LOCK file.
 With --clean: delete local dirs and W&B entries for crashed runs with fewer
   than CLEAN_STEP_THRESHOLD steps; sync crashed runs above the threshold.
 With --rebuild: reconstruct tfevents from W&B history for all runs (finished,
-  running, crashed). Skips runs that already have DONE.
+  running, crashed). Skips runs that already have DONE or are up to date.
 With --update: scan all wandb runs and refresh every local copy with the
   latest results. Skips dirs with a LOCK file and no DONE (in-progress locally).
+With --workers N: parallelise sync/update/rebuild across N threads (default 8).
+With --mark-stale: write DONE to local run dirs whose tfevents have not changed
+  in the last hour (configurable with --stale-hours). Purely local, no W&B API.
 """
 import argparse
 import json
 import pathlib
 import shutil
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import wandb
 
 CLEAN_STEP_THRESHOLD = 600_000
+DEFAULT_WORKERS = 8
 
+
+# ── Hyperparameter config ──────────────────────────────────────────────────────
 
 def _extract_params(run: "wandb.apis.public.Run") -> dict:
     """Map a W&B run config to the hyperparameter dict used by plot_paper.py."""
@@ -46,6 +54,32 @@ def _save_config(run: "wandb.apis.public.Run", run_dir: pathlib.Path) -> None:
     params = _extract_params(run)
     (run_dir / "config.json").write_text(json.dumps(params, indent=2) + "\n")
 
+
+# ── Step tracking (skip-if-up-to-date) ────────────────────────────────────────
+
+def _remote_step(run: "wandb.apis.public.Run") -> int:
+    return int(run.summary.get("global_step", run.summary.get("_step", 0)) or 0)
+
+
+def _local_step(run_dir: pathlib.Path) -> int:
+    step_file = run_dir / ".sync_step"
+    try:
+        return int(step_file.read_text().strip()) if step_file.exists() else -1
+    except (ValueError, OSError):
+        return -1
+
+
+def _save_step(run_dir: pathlib.Path, step: int) -> None:
+    (run_dir / ".sync_step").write_text(str(step) + "\n")
+
+
+def _is_up_to_date(run: "wandb.apis.public.Run", run_dir: pathlib.Path) -> bool:
+    """True if local .sync_step is at least as far as the remote run."""
+    remote = _remote_step(run)
+    return remote > 0 and remote <= _local_step(run_dir)
+
+
+# ── Download helpers ───────────────────────────────────────────────────────────
 
 def _download_tfevents(
     run: "wandb.apis.public.Run",
@@ -97,6 +131,8 @@ def rebuild_from_history(
 
     if (run_dir / "DONE").exists():
         return
+    if _is_up_to_date(run, run_dir):
+        return
 
     rows = list(run.scan_history())
     if not rows:
@@ -124,6 +160,7 @@ def rebuild_from_history(
             writer.add_scalar(key, val, global_step=step)
     writer.close()
 
+    _save_step(run_dir, _remote_step(run))
     if write_done:
         (run_dir / "DONE").write_text(str(run.summary.get("_timestamp", "")) + "\n")
     print(f"  rebuilt {name} ({len(rows)} rows, done={write_done})", file=sys.stderr)
@@ -138,11 +175,11 @@ def sync_run(
     name = run.display_name
     run_dir = runs_root / name
 
-    # Running locally on this machine; don't touch.
     if (run_dir / "LOCK").exists():
         return
-
     if (run_dir / "DONE").exists():
+        return
+    if _is_up_to_date(run, run_dir):
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +191,7 @@ def sync_run(
         rebuild_from_history(run, runs_root, write_done=write_done)
         return
 
+    _save_step(run_dir, _remote_step(run))
     if write_done:
         (run_dir / "DONE").write_text(str(run.summary.get("_timestamp", "")) + "\n")
     print(f"  synced {name} (done={write_done})", file=sys.stderr)
@@ -163,7 +201,7 @@ def update_run(
     run: "wandb.apis.public.Run",
     runs_root: pathlib.Path,
 ) -> None:
-    """Force-refresh a local run from wandb. Skip if in-progress locally (LOCK without DONE)."""
+    """Force-refresh a local run from wandb. Skip if in-progress locally or up to date."""
     name = run.display_name
     run_dir = runs_root / name
 
@@ -175,7 +213,10 @@ def update_run(
     if (run_dir / "LOCK").exists() and (run_dir / "DONE").exists():
         (run_dir / "LOCK").unlink()
 
-    write_done = run.state == "finished" or run.state == "crashed"
+    if _is_up_to_date(run, run_dir):
+        return
+
+    write_done = run.state in ("finished", "crashed")
 
     run_dir.mkdir(parents=True, exist_ok=True)
     _save_config(run, run_dir)
@@ -185,12 +226,12 @@ def update_run(
         print(f"  no tfevents for {name}, rebuilding from history", file=sys.stderr)
         # Temporarily remove DONE so rebuild_from_history proceeds.
         done_path = run_dir / "DONE"
-        had_done = done_path.exists()
-        if had_done:
+        if done_path.exists():
             done_path.unlink()
         rebuild_from_history(run, runs_root, write_done=write_done)
         return
 
+    _save_step(run_dir, _remote_step(run))
     if write_done:
         (run_dir / "DONE").write_text(str(run.summary.get("_timestamp", "")) + "\n")
     print(f"  updated {name} (done={write_done})", file=sys.stderr)
@@ -218,6 +259,44 @@ def clean_crashed(
 
     run.delete()
     print(f"  deleted from wandb: {name}", file=sys.stderr)
+
+
+# ── Stale detection (local, no W&B API) ───────────────────────────────────────
+
+def mark_stale(runs_root: pathlib.Path, max_age_hours: float = 1.0) -> None:
+    """Write DONE to local run dirs whose tfevents haven't changed recently.
+
+    Skips dirs that already have DONE. Checks only tfevents file mtimes so
+    that bookkeeping files (.sync_step, config.json, LOCK) don't interfere.
+    """
+    max_age = max_age_hours * 3600
+    now = time.time()
+    for run_dir in sorted(runs_root.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        if (run_dir / "DONE").exists():
+            continue
+        tfevents = list(run_dir.glob("events.out.tfevents.*"))
+        if not tfevents:
+            continue
+        last_change = max(f.stat().st_mtime for f in tfevents)
+        age_hours = (now - last_change) / 3600
+        if now - last_change > max_age:
+            (run_dir / "DONE").write_text("stale\n")
+            print(f"  marked stale: {run_dir.name} (last change {age_hours:.1f}h ago)",
+                  file=sys.stderr)
+
+
+# ── Parallel dispatch ──────────────────────────────────────────────────────────
+
+def _run_parallel(func, runs: list, workers: int) -> None:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(func, run): run.display_name for run in runs}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as exc:
+                print(f"  ERROR {futures[fut]}: {exc}", file=sys.stderr)
 
 
 def main() -> None:
@@ -255,7 +334,19 @@ def main() -> None:
         help="Exit 0 if a run with this display name is running or finished in wandb, else exit 1.",
     )
     parser.add_argument("--runs-root", default="runs")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Parallel download threads (default {DEFAULT_WORKERS}).")
+    parser.add_argument("--mark-stale", action="store_true",
+                        help="Write DONE to local run dirs whose tfevents haven't changed recently.")
+    parser.add_argument("--stale-hours", type=float, default=1.0,
+                        help="Inactivity threshold for --mark-stale in hours (default 1).")
     args = parser.parse_args()
+
+    runs_root = pathlib.Path(args.runs_root)
+
+    if args.mark_stale:
+        mark_stale(runs_root, max_age_hours=args.stale_hours)
+        return
 
     api = wandb.Api()
 
@@ -267,33 +358,31 @@ def main() -> None:
         )
         sys.exit(0 if list(matching) else 1)
 
-    runs_root = pathlib.Path(args.runs_root)
-
     if args.clean:
-        for run in api.runs(
+        crashed = list(api.runs(
             f"{args.entity}/{args.project}",
             filters={"state": "crashed"},
             per_page=1000,
-        ):
-            clean_crashed(run, runs_root)
+        ))
+        _run_parallel(lambda r: clean_crashed(r, runs_root), crashed, args.workers)
 
     if args.update:
-        for run in api.runs(
+        all_runs = list(api.runs(
             f"{args.entity}/{args.project}",
             filters={"state": {"$in": ["finished", "running", "crashed"]}},
             per_page=1000,
-        ):
-            update_run(run, runs_root)
+        ))
+        _run_parallel(lambda r: update_run(r, runs_root), all_runs, args.workers)
         return
 
     if args.rebuild:
         for state, done in (("finished", True), ("running", False), ("crashed", True)):
-            for run in api.runs(
+            runs = list(api.runs(
                 f"{args.entity}/{args.project}",
                 filters={"state": state},
                 per_page=1000,
-            ):
-                rebuild_from_history(run, runs_root, write_done=done)
+            ))
+            _run_parallel(lambda r, d=done: rebuild_from_history(r, runs_root, write_done=d), runs, args.workers)
         return
 
     if args.list:
@@ -306,23 +395,23 @@ def main() -> None:
         return
 
     if args.sync:
-        for run in api.runs(
+        running = list(api.runs(
             f"{args.entity}/{args.project}",
             filters={"state": "running"},
             per_page=1000,
-        ):
-            sync_run(run, runs_root, write_done=False)
+        ))
+        _run_parallel(lambda r: sync_run(r, runs_root, write_done=False), running, args.workers)
 
-    for run in api.runs(
+    finished = list(api.runs(
         f"{args.entity}/{args.project}",
         filters={"state": "finished"},
         per_page=1000,
-    ):
-        if args.sync:
-            sync_run(run, runs_root, write_done=True)
+    ))
+    if args.sync:
+        _run_parallel(lambda r: sync_run(r, runs_root, write_done=True), finished, args.workers)
+    for run in finished:
         print(run.display_name)
 
 
 if __name__ == "__main__":
     main()
-

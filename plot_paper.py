@@ -237,6 +237,21 @@ def _align(curves):
     return x_common, mean, ci95
 
 
+def _final_value(curves, last_frac: float = 0.2) -> float:
+    """Mean return over the last `last_frac` of each seed's data, averaged across seeds.
+
+    Computed per-seed before averaging so every seed contributes equally,
+    regardless of how many steps past MAX_STEPS each one ran.
+    """
+    seed_finals = []
+    for s, v in curves:
+        threshold = s[-1] * (1 - last_frac)
+        mask = s >= threshold
+        if mask.any():
+            seed_finals.append(float(np.mean(v[mask])))
+    return float(np.mean(seed_finals)) if seed_finals else float("nan")
+
+
 def load_condition(env_id: str, params: dict,
                    metric: str = RETURN_METRIC,
                    n_seeds: int = N_SEEDS):
@@ -445,8 +460,7 @@ def fig4():
             params = {"alg": "ppo", "g": 1.0, "n": 256, "a": la, "c": lc, "reward": "sparse"}
             curves = load_condition(env, params)
             if curves:
-                x, mean, _ = _align(curves)
-                grid[i, j] = mean[-1]
+                grid[i, j] = _final_value(curves)
 
     fig_heat, ax = plt.subplots(figsize=(5, 4))
     im = ax.imshow(grid, aspect="auto", origin="lower",

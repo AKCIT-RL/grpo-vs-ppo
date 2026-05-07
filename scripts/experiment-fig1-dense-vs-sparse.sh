@@ -56,8 +56,8 @@ envs=(Humanoid-v4 Hopper-v4 Walker2d-v4)
 # so exp_names match across figures and skip logic deduplicates correctly.
 declare -a CONDITIONS=(
   "grpo__sparse --grpo --sparse"
-  "ppo__g0_999__n256__a0_95__c_0_95__dense"
-  "ppo__g0_999__n256__a0_95__c_0_95__sparse --sparse"
+  "ppo__g0_999__n256__a0_95__c0_95__dense"
+  "ppo__g0_999__n256__a0_95__c0_95__sparse --sparse"
 )
 
 all_commands=()

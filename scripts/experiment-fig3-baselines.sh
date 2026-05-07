@@ -5,7 +5,7 @@
 # grpo_g1_0_sparse runs are shared with fig1 and fig5 — skipped automatically.
 #
 # Conditions:
-#   grpo_sparse               GRPO: no VF, group_mean+std, γ=1, sparse (shared with fig1, fig5)
+#   grpo__sparse               GRPO: no VF, group_mean+std, γ=1, sparse (shared with fig1, fig5)
 #   ppo_g1_0_n0_a1_0_c1_0_sparse  GAE λ=1 (episodic) ≡ MC returns with VF as baseline, γ=1, sparse
 #
 # Episodic mode (num_steps=0) throughout.  The VF condition logs explained_variance,
@@ -52,7 +52,7 @@ fi
 envs=(Humanoid-v4 Hopper-v4 Walker2d-v4)
 
 declare -a CONDITIONS=(
-  "grpo_sparse --grpo --sparse"
+  "grpo__sparse --grpo --sparse"
   "ppo__g1_0__n0__a1_0__c1_0__sparse --num-steps 0 --gamma 1.0 --sparse --gae-lambda 1.0"
 )
 
