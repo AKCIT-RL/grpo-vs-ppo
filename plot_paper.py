@@ -13,8 +13,10 @@ Usage:
 """
 import argparse
 import glob
+import json
 import os
 import pickle
+import re
 import warnings
 
 import matplotlib
@@ -142,22 +144,67 @@ def _load_scalar(run_dir: str, metric: str):
 
 # ── Run discovery ──────────────────────────────────────────────────────────────
 
-def find_runs(env_id: str, exp_name: str, n_seeds: int = N_SEEDS) -> list[str]:
-    """Return sorted list of run dirs matching {env_id}__{exp_name}__{seed}
-    for seeds 1..n_seeds.  Checks exact path first, falls back to __* glob
-    for legacy dirs with timestamps."""
+def parse_exp_name(exp_name: str) -> dict:
+    """Parse an exp_name segment into a hyperparameter dict.
+
+    Format: {alg}[__{key}{value}...}__{reward}
+    e.g. ppo__g1_0__n256__a0_95__c0_95__sparse
+         grpo__sparse
+
+    Tolerates a stray leading underscore in the value (c_0_95 == c0_95).
+    """
+    tokens = exp_name.split("__")
+    params: dict = {"alg": tokens[0], "reward": tokens[-1]}
+    for tok in tokens[1:-1]:
+        m = re.match(r'^([a-z]+)_?([\d].*)$', tok)
+        if m:
+            key, val_str = m.group(1), m.group(2)
+            normed = val_str.replace("_", ".")
+            try:
+                params[key] = float(normed) if "." in normed else int(normed)
+            except ValueError:
+                params[key] = val_str
+    return params
+
+
+def find_runs(env_id: str, params: dict, n_seeds: int = N_SEEDS) -> list[str]:
+    """Return run dirs whose hyperparameters match *params*, one per seed.
+
+    Reads config.json (written by wandb_fetch_runs.py) when present; otherwise
+    falls back to parsing hyperparameters from the directory name.
+    """
     dirs = []
     for seed in range(1, n_seeds + 1):
-        exact = os.path.join(RUNS_DIR, f"{env_id}__{exp_name}__{seed}")
-        if os.path.isdir(exact):
-            dirs.append(exact)
-            continue
-        pattern = os.path.join(RUNS_DIR, f"{env_id}__{exp_name}__{seed}__*")
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            dirs.append(matches[-1])  # most recent
+        candidates = sorted(
+            glob.glob(os.path.join(RUNS_DIR, f"{env_id}__*__{seed}")) +
+            glob.glob(os.path.join(RUNS_DIR, f"{env_id}__*__{seed}__*"))
+        )
+        matched = None
+        for path in candidates:
+            config_path = os.path.join(path, "config.json")
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path) as f:
+                        run_params = json.load(f)
+                except Exception:
+                    run_params = {}
+            else:
+                name = os.path.basename(path)
+                parts = name.split("__")
+                if parts[-1] == str(seed):
+                    exp_tokens = parts[1:-1]
+                elif len(parts) >= 3 and parts[-2] == str(seed):
+                    exp_tokens = parts[1:-2]
+                else:
+                    continue
+                run_params = parse_exp_name("__".join(exp_tokens))
+            if all(run_params.get(k) == v for k, v in params.items()):
+                matched = path
+                break
+        if matched:
+            dirs.append(matched)
         else:
-            print(f"  MISSING: {env_id}__{exp_name}__{seed}")
+            print(f"  MISSING: {env_id} seed={seed} {params}")
     return dirs
 
 
@@ -166,34 +213,48 @@ def find_runs(env_id: str, exp_name: str, n_seeds: int = N_SEEDS) -> list[str]:
 def _align(curves):
     if not curves:
         return None, None, None
-    x_max    = min(s[-1] for s, _ in curves)
+    x_max    = max(s[-1] for s, _ in curves)
     x_common = np.linspace(0, x_max, N_INTERP)
-    mat = [np.interp(x_common, s, gaussian_filter1d(v, sigma=SMOOTH_SIGMA))
-           for s, v in curves]
-    mat  = np.array(mat)
-    mean = mat.mean(axis=0)
-    ci95 = 1.96 * mat.std(axis=0, ddof=1) / np.sqrt(len(mat))
+
+    # Interpolate each seed, marking points beyond its range as NaN.
+    mat = np.full((len(curves), N_INTERP), np.nan)
+    for i, (s, v) in enumerate(curves):
+        mask = x_common <= s[-1]
+        mat[i, mask] = np.interp(x_common[mask], s, gaussian_filter1d(v, sigma=SMOOTH_SIGMA))
+
+    n_valid = np.sum(~np.isnan(mat), axis=0)
+    # Keep points where at least 1 seed has data.
+    keep = n_valid >= 1
+    x_common = x_common[keep]
+    mat = mat[:, keep]
+    n_valid = n_valid[keep]
+
+    mean = np.nanmean(mat, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        std = np.nanstd(mat, axis=0, ddof=1)
+    ci95 = np.where(n_valid > 1, 1.96 * std / np.sqrt(n_valid), 0.0)
     return x_common, mean, ci95
 
 
-def load_condition(env_id: str, exp_name: str,
+def load_condition(env_id: str, params: dict,
                    metric: str = RETURN_METRIC,
                    n_seeds: int = N_SEEDS):
     curves = []
-    for run_dir in find_runs(env_id, exp_name, n_seeds):
+    for run_dir in find_runs(env_id, params, n_seeds):
         s, v = _load_scalar(run_dir, metric)
         if s is not None and len(s) > 3:
             curves.append((s, v))
     return curves
 
 
-def plot_condition(ax, env_id: str, exp_name: str, label: str, color,
+def plot_condition(ax, env_id: str, params: dict, label: str, color,
                    linestyle: str = "-",
                    metric: str = RETURN_METRIC,
                    n_seeds: int = N_SEEDS):
-    curves = load_condition(env_id, exp_name, metric, n_seeds)
+    curves = load_condition(env_id, params, metric, n_seeds)
     if not curves:
-        print(f"  WARNING: no data for {env_id}/{exp_name}/{metric}")
+        print(f"  WARNING: no data for {env_id} {params} {metric}")
         return None
     x, mean, ci = _align(curves)
     ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=linestyle, label=label)
@@ -242,35 +303,43 @@ def _shared_legend(fig, ax, ncol=3):
 def fig1():
     print("Fig 1: dense vs sparse vs GRPO")
     envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
+    P_GRPO   = {"alg": "grpo", "reward": "sparse"}
+    P_DENSE  = {"alg": "ppo", "g": 0.999, "n": 256, "a": 0.95, "c": 0.95, "reward": "dense"}
+    P_SPARSE = {"alg": "ppo", "g": 0.999, "n": 256, "a": 0.95, "c": 0.95, "reward": "sparse"}
     conditions = [
-        ("grpo__sparse",                          "GRPO",        C_GRPO,       "-"),
-        ("ppo__g0_999__n256__a0_95__c_0_95__dense",  "PPO dense",   C_PPO_DENSE,  "-"),
-        ("ppo__g0_999__n256__a0_95__c_0_95__sparse", "PPO sparse",  C_PPO_SPARSE, "--"),
+        (P_GRPO,   "GRPO",       C_GRPO,       "-"),
+        (P_DENSE,  "PPO dense",  C_PPO_DENSE,  "-"),
+        (P_SPARSE, "PPO sparse", C_PPO_SPARSE, "--"),
     ]
 
     fig, axes = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5),
                              sharey=False)
     for ax, env in zip(axes, envs):
-        finals = {}
-        for exp_name, label, color, ls in conditions:
-            val = plot_condition(ax, env, exp_name, label, color, ls)
-            finals[exp_name] = val
+        aligned = {}
+        for params, label, color, ls in conditions:
+            plot_condition(ax, env, params, label, color, ls)
+            curves = load_condition(env, params)
+            if curves:
+                aligned[id(params)] = _align(curves)
 
-        # Arrow annotating the dense→sparse gap at the right edge
-        dense_key  = "ppo__g0_999__n256__a0_95__c_0_95__dense"
-        sparse_key = "ppo__g0_999__n256__a0_95__c_0_95__sparse"
-        y_dense  = finals.get(dense_key)
-        y_sparse = finals.get(sparse_key)
-        if y_dense is not None and y_sparse is not None and y_dense != y_sparse:
-            x_ann = MAX_STEPS / 1e6
-            ax.annotate(
-                "", xy=(x_ann, y_sparse), xytext=(x_ann, y_dense),
-                arrowprops=dict(arrowstyle="<->", color="black", lw=1.2),
-            )
-            mid = (y_dense + y_sparse) / 2
-            gap = abs(y_dense - y_sparse)
-            ax.text(x_ann * 1.01, mid, f"Δ{gap:.0f}", va="center",
-                    fontsize=7, color="black", clip_on=False)
+        # Arrow annotating the dense→sparse gap where both have data
+        d = aligned.get(id(P_DENSE))
+        s = aligned.get(id(P_SPARSE))
+        if d and s and d[0] is not None and s[0] is not None:
+            # Place arrow near the end of the shorter curve
+            x_end = min(d[0][-1], s[0][-1])
+            x_ann = x_end / 1e6 * 0.92
+            y_dense  = float(np.interp(x_ann, d[0] / 1e6, d[1]))
+            y_sparse = float(np.interp(x_ann, s[0] / 1e6, s[1]))
+            if y_dense != y_sparse:
+                ax.annotate(
+                    "", xy=(x_ann, y_sparse), xytext=(x_ann, y_dense),
+                    arrowprops=dict(arrowstyle="<->", color="black", lw=1.2),
+                )
+                mid = (y_dense + y_sparse) / 2
+                gap = abs(y_dense - y_sparse)
+                ax.text(x_ann * 0.96, mid, f"Δ{gap:.0f}",
+                        va="center", ha="right", fontsize=7, color="black")
 
         _finish_ax(ax, title=env, legend=(ax is axes[-1]))
     axes[0].set_ylabel("Episodic return", fontsize=9)
@@ -289,15 +358,16 @@ def fig1():
 def fig2():
     print("Fig 2: gamma sweep")
     envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
-    gammas = [("0_9", "γ=0.9"), ("0_95", "γ=0.95"), ("0_99", "γ=0.99"), ("0_999", "γ=0.999"), ("1_0", "γ=1")]
+    gammas = [(0.9, "γ=0.9"), (0.95, "γ=0.95"), (0.99, "γ=0.99"), (0.999, "γ=0.999"), (1.0, "γ=1")]
 
     fig, axes = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5),
                              sharey=False)
     for ax, env in zip(axes, envs):
-        for gtag, glabel in gammas:
-            exp_name = f"ppo__g{gtag}__n256__a0_95__c_0_95__sparse"
-            color    = GAMMA_COLORS[gtag]
-            plot_condition(ax, env, exp_name, glabel, color)
+        for gamma, glabel in gammas:
+            gtag   = str(gamma).replace(".", "_")
+            params = {"alg": "ppo", "g": gamma, "n": 256, "a": 0.95, "c": 0.95, "reward": "sparse"}
+            color  = GAMMA_COLORS[gtag]
+            plot_condition(ax, env, params, glabel, color)
         _finish_ax(ax, title=env, legend=(ax is axes[-1]))
     axes[0].set_ylabel("Episodic return (sparse)", fontsize=9)
     for ax in axes[1:]:
@@ -315,16 +385,18 @@ def fig2():
 def fig3():
     print("Fig 3: VF as baseline")
     envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
+    P_GRPO = {"alg": "grpo", "reward": "sparse"}
+    P_VF   = {"alg": "ppo", "g": 1.0, "n": 0, "a": 1.0, "c": 1.0, "reward": "sparse"}
     conditions = [
-        ("grpo_sparse",                    "GRPO",                    C_GRPO,  "-"),
-        ("ppo__g1_0__n0__a1_0__c1_0__sparse", "PPO GAE λ=1 (VF baseline)", C_MC_VF, "-"),
+        (P_GRPO, "GRPO",                      C_GRPO,  "-"),
+        (P_VF,   "PPO GAE λ=1 (VF baseline)", C_MC_VF, "-"),
     ]
 
     # Main: episodic return
     fig_ret, axes_ret = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.5))
     for ax, env in zip(axes_ret, envs):
-        for exp_name, label, color, ls in conditions:
-            plot_condition(ax, env, exp_name, label, color, ls)
+        for params, label, color, ls in conditions:
+            plot_condition(ax, env, params, label, color, ls)
         _finish_ax(ax, title=env, legend=(ax is axes_ret[-1]))
     axes_ret[0].set_ylabel("Episodic return (sparse)", fontsize=9)
     for ax in axes_ret[1:]:
@@ -339,12 +411,11 @@ def fig3():
         ("losses/explained_variance",    "GAE EV (λ-bootstrap target)", C_MC_VF, "-"),
         ("losses/mc_explained_variance", "MC EV (true returns)",         C_MC_VF, "--"),
     ]
-    exp_name = "ppo__g1_0__n0__a1_0__c1_0__sparse"
     fig_ev, axes_ev = plt.subplots(1, len(envs), figsize=(4.5 * len(envs), 3.2),
                                    sharey=False)
     for ax, env in zip(axes_ev, envs):
         for metric, label, color, ls in ev_metrics:
-            curves = load_condition(env, exp_name, metric=metric)
+            curves = load_condition(env, P_VF, metric=metric)
             if curves:
                 x, mean, ci = _align(curves)
                 ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=ls, label=label)
@@ -371,10 +442,8 @@ def fig4():
     grid = np.full((len(LAM_VALS), len(LAM_VALS)), np.nan)
     for i, la in enumerate(LAM_VALS):
         for j, lc in enumerate(LAM_VALS):
-            atag = str(la).replace(".", "_")
-            ctag = str(lc).replace(".", "_")
-            exp_name = f"ppo__g1_0__n256__a{atag}__c{ctag}__sparse"
-            curves = load_condition(env, exp_name)
+            params = {"alg": "ppo", "g": 1.0, "n": 256, "a": la, "c": lc, "reward": "sparse"}
+            curves = load_condition(env, params)
             if curves:
                 x, mean, _ = _align(curves)
                 grid[i, j] = mean[-1]
@@ -404,9 +473,8 @@ def fig4():
     n_actor = len(LAM_VALS)
     colors_la = [_LA_CMAP(0.3 + 0.6 * i / (n_actor - 1)) for i in range(n_actor)]
     for i, la in enumerate(LAM_VALS):
-        atag = str(la).replace(".", "_")
-        exp_name = f"ppo__g1_0__n256__a{atag}__c0_0__sparse"
-        plot_condition(ax, env, exp_name, f"λ_a={la}", colors_la[i])
+        params = {"alg": "ppo", "g": 1.0, "n": 256, "a": la, "c": 0.0, "reward": "sparse"}
+        plot_condition(ax, env, params, f"λ_a={la}", colors_la[i])
     _finish_ax(ax, title=f"{env} — λ_critic=0, sweep λ_actor (sparse, γ=1, H=256)",
                legend_outside=False)
     fig_lc.tight_layout()
@@ -424,13 +492,13 @@ def fig5():
     fig, ax = plt.subplots(figsize=(6, 4))
 
     # GRPO reference
-    plot_condition(ax, env, "grpo__sparse", "GRPO (episodic, no VF)",
-                   C_GRPO, linestyle="--")
+    plot_condition(ax, env, {"alg": "grpo", "reward": "sparse"},
+                   "GRPO (episodic, no VF)", C_GRPO, linestyle="--")
 
     # PPO H sweep (default GAE λ=0.95)
     for H in H_VALS:
-        exp_name = f"ppo__g1_0__n{H}__a0_95__c0_95__sparse"
-        plot_condition(ax, env, exp_name, f"PPO H={H}", H_COLORS[H])
+        params = {"alg": "ppo", "g": 1.0, "n": H, "a": 0.95, "c": 0.95, "reward": "sparse"}
+        plot_condition(ax, env, params, f"PPO H={H}", H_COLORS[H])
 
     _finish_ax(ax, title=f"{env} — subtrajectory learning (sparse, γ=1)",
                legend_outside=False)

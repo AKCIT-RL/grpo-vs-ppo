@@ -15,8 +15,11 @@ With --clean: delete local dirs and W&B entries for crashed runs with fewer
   than CLEAN_STEP_THRESHOLD steps; sync crashed runs above the threshold.
 With --rebuild: reconstruct tfevents from W&B history for all runs (finished,
   running, crashed). Skips runs that already have DONE.
+With --update: scan all wandb runs and refresh every local copy with the
+  latest results. Skips dirs with a LOCK file and no DONE (in-progress locally).
 """
 import argparse
+import json
 import pathlib
 import shutil
 import sys
@@ -24,6 +27,24 @@ import sys
 import wandb
 
 CLEAN_STEP_THRESHOLD = 600_000
+
+
+def _extract_params(run: "wandb.apis.public.Run") -> dict:
+    """Map a W&B run config to the hyperparameter dict used by plot_paper.py."""
+    cfg = run.config
+    alg    = "grpo" if cfg.get("grpo", False) else "ppo"
+    g      = float(cfg.get("gamma", 0.99))
+    n      = int(cfg.get("num_steps", 2048))
+    a      = float(cfg.get("gae_lambda_actor", cfg.get("gae_lambda", 0.95)))
+    c      = float(cfg.get("gae_lambda_critic", cfg.get("gae_lambda", 0.95)))
+    reward = "sparse" if cfg.get("sparse", False) else "dense"
+    return {"alg": alg, "g": g, "n": n, "a": a, "c": c, "reward": reward}
+
+
+def _save_config(run: "wandb.apis.public.Run", run_dir: pathlib.Path) -> None:
+    """Write config.json into run_dir so find_runs can match by hyperparameters."""
+    params = _extract_params(run)
+    (run_dir / "config.json").write_text(json.dumps(params, indent=2) + "\n")
 
 
 def _download_tfevents(
@@ -83,6 +104,7 @@ def rebuild_from_history(
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    _save_config(run, run_dir)
 
     # Remove any existing tfevents so we write a single clean file.
     for old in run_dir.glob("events.out.tfevents.*"):
@@ -124,6 +146,7 @@ def sync_run(
         return
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    _save_config(run, run_dir)
     downloaded = _download_tfevents(run, run_dir, replace=not write_done)
 
     if downloaded == 0:
@@ -134,6 +157,43 @@ def sync_run(
     if write_done:
         (run_dir / "DONE").write_text(str(run.summary.get("_timestamp", "")) + "\n")
     print(f"  synced {name} (done={write_done})", file=sys.stderr)
+
+
+def update_run(
+    run: "wandb.apis.public.Run",
+    runs_root: pathlib.Path,
+) -> None:
+    """Force-refresh a local run from wandb. Skip if in-progress locally (LOCK without DONE)."""
+    name = run.display_name
+    run_dir = runs_root / name
+
+    # In-progress locally: has LOCK but no DONE.
+    if (run_dir / "LOCK").exists() and not (run_dir / "DONE").exists():
+        return
+
+    # Stale LOCK from a finished run; remove it.
+    if (run_dir / "LOCK").exists() and (run_dir / "DONE").exists():
+        (run_dir / "LOCK").unlink()
+
+    write_done = run.state == "finished" or run.state == "crashed"
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _save_config(run, run_dir)
+    downloaded = _download_tfevents(run, run_dir, replace=True)
+
+    if downloaded == 0:
+        print(f"  no tfevents for {name}, rebuilding from history", file=sys.stderr)
+        # Temporarily remove DONE so rebuild_from_history proceeds.
+        done_path = run_dir / "DONE"
+        had_done = done_path.exists()
+        if had_done:
+            done_path.unlink()
+        rebuild_from_history(run, runs_root, write_done=write_done)
+        return
+
+    if write_done:
+        (run_dir / "DONE").write_text(str(run.summary.get("_timestamp", "")) + "\n")
+    print(f"  updated {name} (done={write_done})", file=sys.stderr)
 
 
 def clean_crashed(
@@ -180,6 +240,11 @@ def main() -> None:
         help="Reconstruct tfevents from W&B history for all runs.",
     )
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Scan all wandb runs and refresh every local copy with latest results.",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List finished and running run names (no downloads).",
@@ -211,6 +276,15 @@ def main() -> None:
             per_page=1000,
         ):
             clean_crashed(run, runs_root)
+
+    if args.update:
+        for run in api.runs(
+            f"{args.entity}/{args.project}",
+            filters={"state": {"$in": ["finished", "running", "crashed"]}},
+            per_page=1000,
+        ):
+            update_run(run, runs_root)
+        return
 
     if args.rebuild:
         for state, done in (("finished", True), ("running", False), ("crashed", True)):
