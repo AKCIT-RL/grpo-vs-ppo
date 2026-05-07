@@ -180,6 +180,11 @@ def main() -> None:
         help="Reconstruct tfevents from W&B history for all runs.",
     )
     parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List finished and running run names (no downloads).",
+    )
+    parser.add_argument(
         "--check",
         metavar="NAME",
         help="Exit 0 if a run with this display name is running or finished in wandb, else exit 1.",
@@ -215,6 +220,15 @@ def main() -> None:
                 per_page=1000,
             ):
                 rebuild_from_history(run, runs_root, write_done=done)
+        return
+
+    if args.list:
+        for run in api.runs(
+            f"{args.entity}/{args.project}",
+            filters={"state": {"$in": ["finished", "running"]}},
+            per_page=1000,
+        ):
+            print(run.display_name)
         return
 
     if args.sync:

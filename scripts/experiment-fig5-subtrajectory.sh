@@ -69,8 +69,8 @@ done
 
 
 wandb_runs="$(mktemp)"
-echo "Fetching finished runs from wandb..."
-.venv/bin/python scripts/wandb_fetch_runs.py --sync > "$wandb_runs" 2>/dev/null || true
+echo "Fetching finished/running runs from wandb..."
+.venv/bin/python scripts/wandb_fetch_runs.py --list > "$wandb_runs" 2>/dev/null || true
 
 run_commands=()
 run_names=()
