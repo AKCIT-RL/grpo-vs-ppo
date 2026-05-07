@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -39,6 +39,15 @@ N_INTERP   = 300
 CI_ALPHA   = 0.15
 LINEWIDTH  = 1.8
 N_SEEDS    = 5
+SHOW_N_SEEDS = False  # set True to show seed count in legend labels
+
+# Curve estimation method: "gaussian" (default) or "bootstrap"
+#   gaussian  — gaussian smoothing (sigma=SMOOTH_SIGMA) + parametric 95% CI
+#   bootstrap — sliding-window smoothing (width=SMOOTH_WINDOW) + bootstrap 95% CI
+CI_METHOD      = "bootstrap"
+SMOOTH_WINDOW  = 20           # sliding-window width in grid points (bootstrap mode)
+BOOTSTRAP_REPS = 2000         # bootstrap resamples (bootstrap mode)
+_rng = np.random.default_rng(0)  # fixed seed → reproducible CIs
 
 os.makedirs(FIG_DIR, exist_ok=True)
 
@@ -211,30 +220,59 @@ def find_runs(env_id: str, params: dict, n_seeds: int = N_SEEDS) -> list[str]:
 # ── Aggregation helpers ────────────────────────────────────────────────────────
 
 def _align(curves):
+    """Align curves to a common step grid and compute mean + 95% CI.
+
+    Returns (x, mean, ci_lo, ci_hi) where the shaded band is
+    [mean - ci_lo, mean + ci_hi].  ci_lo == ci_hi for the gaussian method
+    (symmetric parametric CI); they differ for bootstrap.
+    """
     if not curves:
-        return None, None, None
+        return None, None, None, None
     x_max    = max(s[-1] for s, _ in curves)
     x_common = np.linspace(0, x_max, N_INTERP)
 
-    # Interpolate each seed, marking points beyond its range as NaN.
+    # Interpolate to the common step grid first, then smooth in step-space so
+    # that the smoothing window covers the same number of steps for every condition
+    # regardless of how frequently episodes were logged.
     mat = np.full((len(curves), N_INTERP), np.nan)
     for i, (s, v) in enumerate(curves):
         mask = x_common <= s[-1]
-        mat[i, mask] = np.interp(x_common[mask], s, gaussian_filter1d(v, sigma=SMOOTH_SIGMA))
+        interp = np.interp(x_common[mask], s, v)
+        if CI_METHOD == "bootstrap":
+            mat[i, mask] = uniform_filter1d(interp, size=SMOOTH_WINDOW, mode="nearest")
+        else:
+            mat[i, mask] = gaussian_filter1d(interp, sigma=SMOOTH_SIGMA)
 
     n_valid = np.sum(~np.isnan(mat), axis=0)
-    # Keep points where at least 1 seed has data.
-    keep = n_valid >= 1
+    # Drop points where fewer than half the seeds have data to avoid survivor bias.
+    min_seeds = max(1, len(curves) // 2)
+    keep = n_valid >= min_seeds
     x_common = x_common[keep]
-    mat = mat[:, keep]
-    n_valid = n_valid[keep]
+    mat      = mat[:, keep]
+    n_valid  = n_valid[keep]
 
     mean = np.nanmean(mat, axis=0)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        std = np.nanstd(mat, axis=0, ddof=1)
-    ci95 = np.where(n_valid > 1, 1.96 * std / np.sqrt(n_valid), 0.0)
-    return x_common, mean, ci95
+
+    if CI_METHOD == "bootstrap":
+        ci_lo = np.zeros(len(x_common))
+        ci_hi = np.zeros(len(x_common))
+        for j in range(len(x_common)):
+            vals = mat[:, j]
+            valid = vals[~np.isnan(vals)]
+            k = len(valid)
+            if k < 2:
+                continue
+            boot = valid[_rng.integers(0, k, size=(BOOTSTRAP_REPS, k))].mean(axis=1)
+            lo, hi = np.percentile(boot, [2.5, 97.5])
+            ci_lo[j] = mean[j] - lo
+            ci_hi[j] = hi - mean[j]
+        return x_common, mean, ci_lo, ci_hi
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            std = np.nanstd(mat, axis=0, ddof=1)
+        sym = np.where(n_valid > 1, 1.96 * std / np.sqrt(n_valid), 0.0)
+        return x_common, mean, sym, sym
 
 
 def _final_value(curves, last_frac: float = 0.2) -> float:
@@ -271,10 +309,11 @@ def plot_condition(ax, env_id: str, params: dict, label: str, color,
     if not curves:
         print(f"  WARNING: no data for {env_id} {params} {metric}")
         return None
-    x, mean, ci = _align(curves)
-    ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=linestyle, label=label)
-    ax.fill_between(x / 1e6, mean - ci, mean + ci, color=color, alpha=CI_ALPHA)
-    return float(mean[-1])
+    x, mean, ci_lo, ci_hi = _align(curves)
+    lbl = f"{label} (n={len(curves)})" if SHOW_N_SEEDS else label
+    ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=linestyle, label=lbl)
+    ax.fill_between(x / 1e6, mean - ci_lo, mean + ci_hi, color=color, alpha=CI_ALPHA)
+    return len(curves)
 
 
 # ── Axes helpers ───────────────────────────────────────────────────────────────
@@ -400,11 +439,13 @@ def fig2():
 def fig3():
     print("Fig 3: VF as baseline")
     envs = ["Humanoid-v4", "Hopper-v4", "Walker2d-v4"]
-    P_GRPO = {"alg": "grpo", "reward": "sparse"}
-    P_VF   = {"alg": "ppo", "g": 1.0, "n": 0, "a": 1.0, "c": 1.0, "reward": "sparse"}
+    P_GRPO     = {"alg": "grpo", "reward": "sparse"}
+    P_PPO_BASE = {"alg": "ppo", "g": 0.999, "n": 256, "a": 0.95, "c": 0.95, "reward": "sparse"}
+    P_VF       = {"alg": "ppo", "g": 1.0,   "n": 0,   "a": 1.0,  "c": 1.0,  "reward": "sparse"}
     conditions = [
-        (P_GRPO, "GRPO",                      C_GRPO,  "-"),
-        (P_VF,   "PPO GAE λ=1 (VF baseline)", C_MC_VF, "-"),
+        (P_GRPO,     "GRPO",                      C_GRPO,      "-"),
+        (P_PPO_BASE, "PPO (γ=0.999, λ=0.95)",     C_PPO_SPARSE, "--"),
+        (P_VF,       "PPO GAE λ=1 (VF baseline)", C_MC_VF,     "-"),
     ]
 
     # Main: episodic return
@@ -432,9 +473,10 @@ def fig3():
         for metric, label, color, ls in ev_metrics:
             curves = load_condition(env, P_VF, metric=metric)
             if curves:
-                x, mean, ci = _align(curves)
-                ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=ls, label=label)
-                ax.fill_between(x / 1e6, mean - ci, mean + ci, color=color, alpha=CI_ALPHA)
+                x, mean, ci_lo, ci_hi = _align(curves)
+                lbl = f"{label} (n={len(curves)})" if SHOW_N_SEEDS else label
+                ax.plot(x / 1e6, mean, color=color, lw=LINEWIDTH, ls=ls, label=lbl)
+                ax.fill_between(x / 1e6, mean - ci_lo, mean + ci_hi, color=color, alpha=CI_ALPHA)
         _finish_ax(ax, title=env, ylabel="Explained variance",
                    legend=(ax is axes_ev[-1]))
     axes_ev[0].set_ylabel("Explained variance", fontsize=9)
@@ -505,9 +547,11 @@ def fig5():
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    # GRPO reference
+    # Reference lines
     plot_condition(ax, env, {"alg": "grpo", "reward": "sparse"},
                    "GRPO (episodic, no VF)", C_GRPO, linestyle="--")
+    plot_condition(ax, env, {"alg": "ppo", "g": 1.0, "n": 0, "a": 1.0, "c": 1.0, "reward": "sparse"},
+                   "PPO episodic (VF baseline)", C_MC_VF, linestyle="--")
 
     # PPO H sweep (default GAE λ=0.95)
     for H in H_VALS:
